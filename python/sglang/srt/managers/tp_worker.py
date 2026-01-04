@@ -193,7 +193,11 @@ class BaseTpWorker(ABC):
         delta_chunks = pickle.loads(base64.b64decode(serialized_data))
 
         # Pass delta_chunks directly to model_runner (expects list of dicts)
-        success, message = self.model_runner.update_weights_from_delta(delta_chunks)
+        # Include protocol_version for compatibility check
+        success, message = self.model_runner.update_weights_from_delta(
+            delta_chunks,
+            protocol_version=recv_req.protocol_version,
+        )
         return success, message
 
     def get_param_sample_hashes(self, recv_req: GetParamSampleHashesReqInput):

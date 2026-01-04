@@ -2855,6 +2855,7 @@ class ModelRunner:
     def update_weights_from_delta(
         self,
         delta_chunks: List[Tuple[str, torch.Tensor, torch.Tensor]],
+        protocol_version: str = None,
     ):
         """
         Update model weights from delta updates (sparse or dense).
@@ -2872,10 +2873,19 @@ class ModelRunner:
                 - For sparse (global): indices (int32), values (bf16), shape, partition_dim
                 - For dense: tensor (full tensor), shape, partition_dim
                 - moe_info: optional dict with expert_id and proj_type for MoE params
+            protocol_version: Protocol version string for compatibility check
 
         Returns:
             Tuple of (success: bool, message: str)
         """
+        # Protocol version check for Slime↔SGLang compatibility
+        EXPECTED_PROTOCOL_VERSION = "1.0"
+        if protocol_version is not None and protocol_version != EXPECTED_PROTOCOL_VERSION:
+            logger.warning(
+                f"Delta sync protocol version mismatch: expected {EXPECTED_PROTOCOL_VERSION}, "
+                f"got {protocol_version}. This may cause compatibility issues."
+            )
+
         if len(delta_chunks) == 0:
             return True, "No parameters to update"
 

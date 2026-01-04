@@ -1195,6 +1195,8 @@ class UpdateWeightsFromDeltaReqInput(BaseReq):
     flush_cache: bool = True
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Optional: Protocol version for Slime↔SGLang compatibility check
+    protocol_version: Optional[str] = None
 
 
 @dataclass
