@@ -25,6 +25,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.dllm.algorithm.base import DllmAlgorithm
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
+    GetParamSampleHashesReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
@@ -32,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDeltaReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -176,6 +178,28 @@ class BaseTpWorker(ABC):
         """Update weights from IPC for checkpoint-engine integration."""
         success, message = self.model_runner.update_weights_from_ipc(recv_req)
         return success, message
+
+    def update_weights_from_delta(self, recv_req: UpdateWeightsFromDeltaReqInput):
+        """Update weights from sparse delta updates.
+
+        This is more efficient than full weight replacement when only a small
+        fraction of elements have changed (e.g., in RL training scenarios).
+        """
+        import pickle
+        import base64
+
+        # Deserialize delta chunks for this tp_rank using pickle+base64
+        serialized_data = recv_req.serialized_delta_chunks[self.tp_rank]
+        delta_chunks = pickle.loads(base64.b64decode(serialized_data))
+
+        # Pass delta_chunks directly to model_runner (expects list of dicts)
+        success, message = self.model_runner.update_weights_from_delta(delta_chunks)
+        return success, message
+
+    def get_param_sample_hashes(self, recv_req: GetParamSampleHashesReqInput):
+        """Get sampling hashes for specified parameters (for delta sync verification)."""
+        hashes = self.model_runner.get_param_sample_hashes(recv_req.param_names)
+        return hashes
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.model_runner.get_weights_by_name(

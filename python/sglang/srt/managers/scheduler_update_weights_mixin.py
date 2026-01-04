@@ -27,12 +27,16 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    UpdateWeightsFromDeltaReqInput,
+    UpdateWeightsFromDeltaReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    GetParamSampleHashesReqInput,
+    GetParamSampleHashesReqOutput,
 )
 
 if TYPE_CHECKING:
@@ -103,6 +107,32 @@ class SchedulerUpdateWeightsMixin:
             logger.error(message)
         torch.distributed.barrier(group=self.tp_cpu_group)
         return UpdateWeightsFromIPCReqOutput(success, message)
+
+    def update_weights_from_delta(self, recv_req: UpdateWeightsFromDeltaReqInput):
+        """Update the online model parameter from sparse delta updates.
+
+        This is more efficient than full weight replacement when only a small
+        fraction of elements have changed (e.g., in RL training scenarios).
+        """
+        worker = self.draft_worker or self.tp_worker
+        success, message = worker.update_weights_from_delta(recv_req)
+        if success:
+            if recv_req.flush_cache:
+                flush_cache_success = self.flush_cache()
+                assert flush_cache_success, "Cache flush failed after updating weights"
+        else:
+            logger.error(message)
+        torch.distributed.barrier(group=self.tp_cpu_group)
+        return UpdateWeightsFromDeltaReqOutput(success, message)
+
+    def get_param_sample_hashes(self, recv_req: GetParamSampleHashesReqInput):
+        """Get sampling hashes for specified parameters (for delta sync verification)."""
+        worker = self.draft_worker or self.tp_worker
+        hashes = worker.get_param_sample_hashes(recv_req)
+        # Collect hashes from all TP ranks
+        all_hashes = [None] * self.tp_size
+        torch.distributed.all_gather_object(all_hashes, hashes, group=self.tp_cpu_group)
+        return GetParamSampleHashesReqOutput(hashes_by_rank=all_hashes)
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.tp_worker.get_weights_by_name(recv_req)

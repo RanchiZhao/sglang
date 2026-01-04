@@ -63,12 +63,16 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UpdateWeightsFromDeltaReqInput,
+    UpdateWeightsFromDeltaReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    GetParamSampleHashesReqInput,
+    GetParamSampleHashesReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -176,6 +180,12 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_ipc_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_weights_from_delta_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.get_param_sample_hashes_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -248,6 +258,14 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromIPCReqOutput,
                     self.update_weights_from_ipc_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromDeltaReqOutput,
+                    self.update_weights_from_delta_communicator.handle_recv,
+                ),
+                (
+                    GetParamSampleHashesReqOutput,
+                    self.get_param_sample_hashes_communicator.handle_recv,
                 ),
                 (
                     GetWeightsByNameReqOutput,
@@ -521,6 +539,57 @@ class TokenizerCommunicatorMixin:
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    async def update_weights_from_delta(
+        self: "TokenizerManager",
+        obj: UpdateWeightsFromDeltaReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Update weights via sparse delta updates.
+
+        This is more efficient than full weight replacement when only a small
+        fraction of elements have changed (e.g., in RL training scenarios).
+        """
+        self.auto_create_handle_loop()
+        try:
+            assert (
+                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+            ), "dp_size must be 1 or dp attention must be enabled for delta weight updates"
+
+            logger.info("Starting delta weight update")
+            # Weight sync cannot run while requests are in progress.
+            async with self.model_update_lock.writer_lock:
+                result = (await self.update_weights_from_delta_communicator(obj))[0]
+                success, message = result.success, result.message
+
+            if success and obj.flush_cache:
+                self.flush_cache()
+
+        except Exception as e:
+            error_msg = f"Delta weight update failed: {str(e)}"
+            logger.error(error_msg)
+            success, message = False, error_msg
+
+        if success and obj.weight_version is not None:
+            self._update_weight_version_if_provided(obj.weight_version)
+            message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
+
+    async def get_param_sample_hashes(
+        self: "TokenizerManager",
+        obj: GetParamSampleHashesReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> GetParamSampleHashesReqOutput:
+        """Get sampling hashes for specified parameters (for delta sync verification)."""
+        self.auto_create_handle_loop()
+        try:
+            result = (await self.get_param_sample_hashes_communicator(obj))[0]
+            return result
+        except Exception as e:
+            error_msg = f"Get param sample hashes failed: {str(e)}"
+            logger.error(error_msg)
+            return GetParamSampleHashesReqOutput(hashes_by_rank=[])
 
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,

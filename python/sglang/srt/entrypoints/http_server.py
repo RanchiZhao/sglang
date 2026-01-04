@@ -100,11 +100,13 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromDeltaReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
+    GetParamSampleHashesReqInput,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
@@ -859,6 +861,48 @@ async def update_weights_from_tensor(
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/update_weights_from_delta")
+async def update_weights_from_delta(
+    obj: UpdateWeightsFromDeltaReqInput, request: Request
+):
+    """Update the weights from sparse delta updates.
+
+    This is more efficient than full weight replacement when only a small
+    fraction of elements have changed (e.g., in RL training scenarios).
+
+    Notes:
+    1. Each tp_rank receives pre-mapped local indices
+    2. Uses index_copy_ for efficient sparse updates
+    3. Serialized delta chunks contain (param_name, indices, values) tuples
+    """
+    success, message = await _global_state.tokenizer_manager.update_weights_from_delta(
+        obj, request
+    )
+
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/get_param_sample_hashes")
+async def get_param_sample_hashes(
+    obj: GetParamSampleHashesReqInput, request: Request
+):
+    """Get sampling hashes for specified parameters (for delta sync verification).
+
+    Used to verify correctness of delta weight sync by comparing hashes
+    between Slime (Megatron) and SGLang.
+    """
+    response = await _global_state.tokenizer_manager.get_param_sample_hashes(
+        obj, request
+    )
+
+    return ORJSONResponse(
+        {"hashes_by_rank": response.hashes_by_rank}, status_code=200
     )
 
 

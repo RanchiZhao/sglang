@@ -2852,6 +2852,676 @@ class ModelRunner:
             logger.error(f"IPC weight update failed: {e}")
             return False, str(e)
 
+    def update_weights_from_delta(
+        self,
+        delta_chunks: List[Tuple[str, torch.Tensor, torch.Tensor]],
+    ):
+        """
+        Update model weights from delta updates (sparse or dense).
+
+        Supports three modes:
+        1. Sparse (local): Receives pre-computed local_indices/local_values, directly index_copy_
+        2. Sparse (global): Receives global indices, maps to local via TP mapping
+        3. Dense: Receives full tensor and uses load_weights for TP sharding
+
+        Args:
+            delta_chunks: List of delta dictionaries with fields:
+                - param_name: HF parameter name
+                - is_sparse: bool, True for sparse update
+                - For sparse (local): local_indices (int32), local_values (bf16), local_shape
+                - For sparse (global): indices (int32), values (bf16), shape, partition_dim
+                - For dense: tensor (full tensor), shape, partition_dim
+                - moe_info: optional dict with expert_id and proj_type for MoE params
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        if len(delta_chunks) == 0:
+            return True, "No parameters to update"
+
+        params_dict = dict(self.model.named_parameters())
+        sparse_updated = 0
+        sparse_elements = 0
+        dense_updated = 0
+        moe_expert_updated = 0
+
+        # Collect ALL dense params for batched load_weights (both MoE and non-MoE)
+        # load_weights handles HF→SGLang naming mapping (q_proj→qkv_proj, experts.Y→fused, etc.)
+        dense_weights_batch = []
+
+        for chunk in delta_chunks:
+            param_name = chunk["param_name"]
+            is_sparse = chunk.get("is_sparse", False)
+            is_moe_expert = chunk.get("is_moe_expert", False)
+
+            # Step 5.1 + 5.3: Direct MoE expert write (bypasses load_weights)
+            if is_moe_expert:
+                moe_info = chunk.get("moe_info", {})
+                expert_id = moe_info.get("expert_id")
+                proj_type = moe_info.get("proj_type")
+
+                if expert_id is None or proj_type is None:
+                    logger.warning(f"MoE expert {param_name} missing moe_info, skipping")
+                    continue
+
+                if is_sparse:
+                    # Step 5.3: Sparse MoE expert update
+                    per_tp_data = chunk.get("per_tp_data", {})
+                    shape = chunk.get("shape")
+                    success = self._update_moe_expert_weight_sparse(
+                        param_name=param_name,
+                        per_tp_data=per_tp_data,
+                        shape=shape,
+                        expert_id=expert_id,
+                        proj_type=proj_type,
+                        params_dict=params_dict,
+                    )
+                else:
+                    # Step 5.1: Dense MoE expert update
+                    success = self._update_moe_expert_weight(
+                        param_name=param_name,
+                        full_tensor=chunk.get("tensor"),
+                        expert_id=expert_id,
+                        proj_type=proj_type,
+                        params_dict=params_dict,
+                    )
+                if success:
+                    moe_expert_updated += 1
+                continue
+
+            if is_sparse:
+                # Sparse update: apply index_copy_
+                # Only works for params that exist in SGLang model with same name
+                if param_name not in params_dict:
+                    # Skip - param uses different naming in SGLang (e.g., fused qkv)
+                    logger.debug(f"Sparse: {param_name} not in model params, skipping")
+                    continue
+
+                param = params_dict[param_name]
+
+                # Check if we have pre-computed local indices (new format)
+                # or global indices (old format requiring TP mapping)
+                if "local_indices" in chunk:
+                    # New format: pre-computed local indices from Slime
+                    local_indices = chunk["local_indices"]
+                    local_values = chunk["local_values"]
+
+                    if local_indices.numel() == 0:
+                        continue
+
+                    # Move to device
+                    local_indices = local_indices.to(self.device, dtype=torch.int64)
+                    local_values = local_values.to(self.device)
+
+                    # Direct index_copy_ (no mapping needed)
+                    param.view(-1).index_copy_(0, local_indices, local_values)
+                    sparse_updated += 1
+                    sparse_elements += local_indices.numel()
+
+                elif "indices" in chunk:
+                    # Old format: global indices, need TP mapping
+                    partition_dim = chunk.get("partition_dim")
+                    global_shape = chunk.get("shape")
+                    global_indices = chunk["indices"].to(self.device)  # int32
+                    values = chunk["values"].to(self.device)  # bf16
+
+                    if global_indices.numel() == 0:
+                        continue
+
+                    # Map global indices to local indices for this TP rank
+                    local_indices, local_mask = self._map_global_to_local_indices(
+                        global_indices=global_indices,
+                        global_shape=global_shape,
+                        local_shape=param.shape,
+                        partition_dim=partition_dim,
+                    )
+
+                    if local_indices is not None and local_indices.numel() > 0:
+                        # Apply sparse update via index_copy_
+                        local_values = values[local_mask]
+                        param.view(-1).index_copy_(0, local_indices, local_values)
+                        sparse_updated += 1
+                        sparse_elements += local_indices.numel()
+            else:
+                # Dense update: batch for single load_weights call
+                # load_weights handles HF→SGLang naming (qkv fusion, MoE fusion, etc.)
+                full_tensor = chunk.get("tensor", chunk.get("values"))
+                if full_tensor is None:
+                    continue
+                full_tensor = full_tensor.to(self.device)
+                dense_weights_batch.append((param_name, full_tensor))
+
+        # Single batched load_weights call for all dense params
+        if dense_weights_batch:
+            try:
+                self.model.load_weights(dense_weights_batch)
+                dense_updated = len(dense_weights_batch)
+            except Exception as e:
+                logger.error(f"Batched dense update failed: {e}")
+                dense_updated = 0
+
+        return True, f"Updated {sparse_updated} sparse ({sparse_elements} elements) + {dense_updated} dense + {moe_expert_updated} MoE expert parameters"
+
+    def _update_moe_expert_weight(
+        self,
+        param_name: str,
+        full_tensor: torch.Tensor,
+        expert_id: int,
+        proj_type: str,
+        params_dict: dict,
+    ) -> bool:
+        """Update a single MoE expert weight by writing directly to fused tensor.
+
+        Step 5.1: Direct expert write, bypasses load_weights().
+
+        Args:
+            param_name: HF param name like 'model.layers.0.mlp.experts.5.gate_proj.weight'
+            full_tensor: The expert weight tensor (full, not TP-sharded)
+            expert_id: Global expert ID
+            proj_type: One of 'gate_proj', 'up_proj', 'down_proj'
+            params_dict: Dict of model parameters
+
+        Returns:
+            True if update succeeded, False otherwise
+        """
+        import re
+
+        if full_tensor is None:
+            return False
+
+        # Extract layer index from param_name
+        match = re.search(r"model\.layers\.(\d+)\.mlp\.experts", param_name)
+        if not match:
+            logger.warning(f"Cannot parse layer index from {param_name}")
+            return False
+        layer_idx = match.group(1)
+
+        # Determine fused tensor name based on proj_type
+        # gate_proj (w1) and up_proj (w3) → experts.w13_weight
+        # down_proj (w2) → experts.w2_weight
+        if proj_type in ("gate_proj", "up_proj"):
+            fused_name = f"model.layers.{layer_idx}.mlp.experts.w13_weight"
+        else:  # down_proj
+            fused_name = f"model.layers.{layer_idx}.mlp.experts.w2_weight"
+
+        if fused_name not in params_dict:
+            logger.warning(f"Fused tensor {fused_name} not found in model params")
+            return False
+
+        fused_param = params_dict[fused_name]
+        # fused_param shape: [num_local_experts, out_dim, in_dim]
+
+        # Get EP configuration from model's MoE layer
+        # We need to find the FusedMoE layer to get ep_rank and num_local_experts
+        try:
+            moe_layer = self._get_moe_layer(layer_idx)
+            if moe_layer is None:
+                logger.warning(f"Cannot find MoE layer for layer {layer_idx}")
+                return False
+
+            moe_ep_rank = moe_layer.moe_ep_rank
+            moe_ep_size = moe_layer.moe_ep_size
+            num_local_experts = moe_layer.num_local_experts
+            num_fused_shared_experts = getattr(moe_layer, 'num_fused_shared_experts', 0)
+        except Exception as e:
+            logger.warning(f"Cannot get MoE EP config: {e}")
+            return False
+
+        # Compute local_expert_id from global expert_id
+        # Same logic as FusedMoE._map_global_expert_id_to_local_expert_id
+        num_global_routed_experts = moe_layer.num_experts - num_fused_shared_experts
+        num_local_routed_experts = num_local_experts - num_fused_shared_experts
+        start_idx = moe_ep_rank * num_local_routed_experts
+        end_idx = (moe_ep_rank + 1) * num_local_routed_experts
+
+        if start_idx <= expert_id < end_idx:
+            local_expert_id = expert_id - start_idx
+        elif num_fused_shared_experts > 0 and expert_id >= num_global_routed_experts:
+            # Shared expert
+            local_expert_id = expert_id - num_global_routed_experts + num_local_routed_experts
+        else:
+            # Expert not on this EP rank
+            logger.debug(f"Expert {expert_id} not on EP rank {moe_ep_rank}, skipping")
+            return True  # Not an error, just not for this rank
+
+        # Move tensor to device
+        full_tensor = full_tensor.to(self.device)
+
+        # Write to fused tensor position
+        # For w13 (gate_up fused): gate_proj goes to first half, up_proj goes to second half
+        # fused_param[local_expert_id] shape: [2*intermediate_per_tp, hidden] for w13
+        #                                     [hidden, intermediate_per_tp] for w2
+        #
+        # IMPORTANT: The fused tensor is already TP-sharded, but HF tensor is full.
+        # We need to slice the HF tensor to the TP-local portion before writing.
+        #
+        # For gate_proj/up_proj (ColumnParallel): partition along output dim (dim 0)
+        # For down_proj (RowParallel): partition along input dim (dim 1)
+
+        tp_rank = self.tp_rank
+        tp_size = self.tp_size
+
+        # Get intermediate_size_per_partition from MoE layer config (more robust than shape inference)
+        intermediate_per_tp = moe_layer.intermediate_size_per_partition
+
+        # Check if triton kernels are used (shapes are transposed)
+        use_triton = getattr(moe_layer, 'use_triton_kernels', False)
+
+        # Log the mapping for debugging Step 5.1
+        logger.info(
+            f"[Step 5.1] MoE expert write: layer={layer_idx}, "
+            f"global_expert_id={expert_id}, local_expert_id={local_expert_id}, "
+            f"proj_type={proj_type}, ep_rank={moe_ep_rank}, tp_rank={tp_rank}, "
+            f"intermediate_per_tp={intermediate_per_tp}, use_triton={use_triton}, "
+            f"fused_shape={tuple(fused_param.shape)}, hf_shape={tuple(full_tensor.shape)}"
+        )
+
+        if proj_type == "gate_proj":
+            # gate_proj → w13_weight[local_expert_id, :intermediate_per_tp, :] (non-triton)
+            #          → w13_weight[local_expert_id, :, :intermediate_per_tp] (triton, transposed)
+            # HF shape: [intermediate_full, hidden]
+            # TP shard: [intermediate_full // tp_size, hidden] per rank
+            intermediate_full = full_tensor.shape[0]
+            shard_size = intermediate_full // tp_size
+            start = tp_rank * shard_size
+            end = start + shard_size
+            tp_shard = full_tensor[start:end, :]
+
+            if use_triton:
+                # Triton: [experts, hidden, 2*intermediate_per_tp], gate is [:, :, :intermediate_per_tp]
+                fused_param.data[local_expert_id, :, :intermediate_per_tp] = tp_shard.T
+            else:
+                # Non-triton: [experts, 2*intermediate_per_tp, hidden], gate is [:, :intermediate_per_tp, :]
+                fused_param.data[local_expert_id, :intermediate_per_tp, :] = tp_shard
+        elif proj_type == "up_proj":
+            # up_proj → w13_weight[local_expert_id, intermediate_per_tp:, :] (non-triton)
+            #        → w13_weight[local_expert_id, :, intermediate_per_tp:] (triton, transposed)
+            intermediate_full = full_tensor.shape[0]
+            shard_size = intermediate_full // tp_size
+            start = tp_rank * shard_size
+            end = start + shard_size
+            tp_shard = full_tensor[start:end, :]
+
+            if use_triton:
+                # Triton: [experts, hidden, 2*intermediate_per_tp], up is [:, :, intermediate_per_tp:]
+                fused_param.data[local_expert_id, :, intermediate_per_tp:] = tp_shard.T
+            else:
+                # Non-triton: [experts, 2*intermediate_per_tp, hidden], up is [:, intermediate_per_tp:, :]
+                fused_param.data[local_expert_id, intermediate_per_tp:, :] = tp_shard
+        elif proj_type == "down_proj":
+            # down_proj → w2_weight[local_expert_id, :, :]
+            # HF shape: [hidden, intermediate_full]
+            # TP shard (RowParallel): [hidden, intermediate_full // tp_size] per rank
+            intermediate_full = full_tensor.shape[1]
+            shard_size = intermediate_full // tp_size
+            start = tp_rank * shard_size
+            end = start + shard_size
+            tp_shard = full_tensor[:, start:end]
+
+            if use_triton:
+                # Triton: [experts, intermediate_per_tp, hidden], transposed from [hidden, intermediate_per_tp]
+                fused_param.data[local_expert_id, :, :] = tp_shard.T
+            else:
+                # Non-triton: [experts, hidden, intermediate_per_tp]
+                fused_param.data[local_expert_id, :, :] = tp_shard
+        else:
+            logger.warning(f"Unknown proj_type: {proj_type}")
+            return False
+
+        return True
+
+    def _update_moe_expert_weight_sparse(
+        self,
+        param_name: str,
+        per_tp_data: dict,
+        shape: tuple,
+        expert_id: int,
+        proj_type: str,
+        params_dict: dict,
+    ) -> bool:
+        """Update a single MoE expert weight using sparse indices (Step 5.3).
+
+        This method applies sparse updates to MoE expert weights using index_copy_,
+        which is much faster than full tensor replacement when only a small
+        fraction of weights have changed.
+
+        Args:
+            param_name: HF param name like 'model.layers.0.mlp.experts.5.gate_proj.weight'
+            per_tp_data: Dict mapping tp_rank -> {indices: Tensor, values: Tensor}
+            shape: Original HF tensor shape (intermediate_full, hidden) or (hidden, intermediate_full)
+            expert_id: Global expert ID
+            proj_type: One of 'gate_proj', 'up_proj', 'down_proj'
+            params_dict: Dict of model parameters
+
+        Returns:
+            True if update succeeded, False otherwise
+        """
+        import re
+
+        # Extract layer index from param_name
+        match = re.search(r"model\.layers\.(\d+)\.mlp\.experts", param_name)
+        if not match:
+            logger.warning(f"Cannot parse layer index from {param_name}")
+            return False
+        layer_idx = match.group(1)
+
+        # Determine fused tensor name based on proj_type
+        if proj_type in ("gate_proj", "up_proj"):
+            fused_name = f"model.layers.{layer_idx}.mlp.experts.w13_weight"
+        else:  # down_proj
+            fused_name = f"model.layers.{layer_idx}.mlp.experts.w2_weight"
+
+        if fused_name not in params_dict:
+            logger.warning(f"Fused tensor {fused_name} not found in model params")
+            return False
+
+        fused_param = params_dict[fused_name]
+
+        # Get EP configuration from model's MoE layer
+        try:
+            moe_layer = self._get_moe_layer(layer_idx)
+            if moe_layer is None:
+                logger.warning(f"Cannot find MoE layer for layer {layer_idx}")
+                return False
+
+            moe_ep_rank = moe_layer.moe_ep_rank
+            num_local_experts = moe_layer.num_local_experts
+            num_fused_shared_experts = getattr(moe_layer, 'num_fused_shared_experts', 0)
+            intermediate_per_tp = moe_layer.intermediate_size_per_partition
+        except Exception as e:
+            logger.warning(f"Cannot get MoE EP config: {e}")
+            return False
+
+        # Compute local_expert_id from global expert_id
+        num_global_routed_experts = moe_layer.num_experts - num_fused_shared_experts
+        num_local_routed_experts = num_local_experts - num_fused_shared_experts
+        start_idx = moe_ep_rank * num_local_routed_experts
+        end_idx = (moe_ep_rank + 1) * num_local_routed_experts
+
+        if start_idx <= expert_id < end_idx:
+            local_expert_id = expert_id - start_idx
+        elif num_fused_shared_experts > 0 and expert_id >= num_global_routed_experts:
+            local_expert_id = expert_id - num_global_routed_experts + num_local_routed_experts
+        else:
+            # Expert not on this EP rank - skip
+            return True
+
+        tp_rank = self.tp_rank
+
+        # Get this TP rank's indices and values
+        tp_data = per_tp_data.get(tp_rank) or per_tp_data.get(str(tp_rank))
+        if tp_data is None:
+            # No updates for this TP rank
+            return True
+
+        local_indices = tp_data.get("indices")
+        local_values = tp_data.get("values")
+
+        if local_indices is None or local_values is None or len(local_indices) == 0:
+            return True
+
+        # Convert to tensors on device
+        local_indices = torch.as_tensor(local_indices, device=self.device, dtype=torch.long)
+        local_values = torch.as_tensor(local_values, device=self.device, dtype=fused_param.dtype)
+
+        # Check if triton kernels are used (shapes are transposed)
+        use_triton = getattr(moe_layer, 'use_triton_kernels', False)
+
+        # Get the expert's slice in the fused tensor
+        # fused_param shape: [num_local_experts, dim1, dim2]
+        expert_slice = fused_param.data[local_expert_id]
+
+        # Compute the offset within the fused tensor based on proj_type
+        # For w13: gate_proj uses first half, up_proj uses second half
+        # For w2: the whole slice is for down_proj
+        if proj_type == "gate_proj":
+            if use_triton:
+                # Triton w13: [hidden, 2*intermediate_per_tp], gate is [:, :intermediate_per_tp]
+                # Indices are in HF layout [intermediate_per_tp, hidden], need to transpose
+                # Local indices are already in TP-local HF layout: flat indices into [shard_size, hidden]
+                hidden_dim = expert_slice.shape[0]
+                shard_size = intermediate_per_tp
+                # Convert flat indices to 2D, transpose, then back to flat in fused layout
+                row_idx = local_indices // hidden_dim  # intermediate index (0..shard_size-1)
+                col_idx = local_indices % hidden_dim   # hidden index
+                # In triton layout: [hidden, intermediate], so new_flat = col * intermediate + row
+                fused_indices = col_idx * (2 * shard_size) + row_idx
+            else:
+                # Non-triton w13: [2*intermediate_per_tp, hidden], gate is [:intermediate_per_tp, :]
+                # No offset needed, indices are already correct for first half
+                fused_indices = local_indices
+        elif proj_type == "up_proj":
+            if use_triton:
+                # Triton w13: [hidden, 2*intermediate_per_tp], up is [:, intermediate_per_tp:]
+                hidden_dim = expert_slice.shape[0]
+                shard_size = intermediate_per_tp
+                row_idx = local_indices // hidden_dim
+                col_idx = local_indices % hidden_dim
+                # Add offset for up_proj (second half)
+                fused_indices = col_idx * (2 * shard_size) + (row_idx + shard_size)
+            else:
+                # Non-triton w13: [2*intermediate_per_tp, hidden], up is [intermediate_per_tp:, :]
+                # Add offset: indices in first half → indices in second half
+                hidden_dim = expert_slice.shape[1]
+                fused_indices = local_indices + intermediate_per_tp * hidden_dim
+        elif proj_type == "down_proj":
+            if use_triton:
+                # Triton w2: [intermediate_per_tp, hidden], HF is [hidden, intermediate_per_tp]
+                # Need to transpose indices
+                shard_size = expert_slice.shape[0]
+                hidden_dim = expert_slice.shape[1]
+                # HF flat: row * intermediate + col → Triton flat: col * intermediate + row
+                row_idx = local_indices // shard_size  # hidden index
+                col_idx = local_indices % shard_size   # intermediate index
+                fused_indices = col_idx * hidden_dim + row_idx
+            else:
+                # Non-triton w2: [hidden, intermediate_per_tp], same as HF TP-local
+                fused_indices = local_indices
+        else:
+            logger.warning(f"Unknown proj_type: {proj_type}")
+            return False
+
+        # Apply sparse update using index_copy_
+        expert_slice.view(-1).index_copy_(0, fused_indices, local_values)
+
+        logger.debug(
+            f"[Step 5.3] MoE sparse update: layer={layer_idx}, expert={expert_id}, "
+            f"proj={proj_type}, tp_rank={tp_rank}, num_indices={len(local_indices)}"
+        )
+
+        return True
+
+    def _get_moe_layer(self, layer_idx: str):
+        """Get the FusedMoE layer for a given layer index."""
+        try:
+            layer_idx_int = int(layer_idx)
+            # Navigate to the MoE layer
+            # Structure: model.layers[layer_idx].mlp.experts
+            layer = self.model.model.layers[layer_idx_int]
+            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
+                return layer.mlp.experts
+            elif hasattr(layer, 'mlp') and hasattr(layer.mlp, 'moe'):
+                return layer.mlp.moe
+            # Try alternative structures
+            if hasattr(layer, 'block') and hasattr(layer.block, 'mlp'):
+                mlp = layer.block.mlp
+                if hasattr(mlp, 'experts'):
+                    return mlp.experts
+        except Exception as e:
+            logger.debug(f"Error navigating to MoE layer: {e}")
+        return None
+
+    def _map_global_to_local_indices(
+        self,
+        global_indices: torch.Tensor,
+        global_shape: tuple,
+        local_shape: tuple,
+        partition_dim: int | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """
+        Map global flatten indices to local flatten indices for TP sharding.
+
+        Args:
+            global_indices: Flatten indices in global (full) tensor
+            global_shape: Shape of the global (full) tensor
+            local_shape: Shape of the local (TP-sharded) tensor
+            partition_dim: 0 for ColumnParallel, 1 for RowParallel, None for Replicated
+
+        Returns:
+            (local_indices, mask) - indices in local tensor, mask for which global indices belong to this rank
+        """
+        tp_rank = self.tp_rank
+        tp_size = self.tp_size
+
+        if partition_dim is None or tp_size == 1:
+            # Replicated or single GPU: indices are the same
+            return global_indices.to(torch.int64), torch.ones(global_indices.shape, dtype=torch.bool, device=global_indices.device)
+
+        if len(global_shape) == 1:
+            # 1D tensor (e.g., bias)
+            total_size = global_shape[0]
+            shard_size = total_size // tp_size
+
+            if partition_dim == 0:
+                # ColumnParallel 1D: partition along the only dimension
+                start = tp_rank * shard_size
+                end = start + shard_size
+
+                mask = (global_indices >= start) & (global_indices < end)
+                local_indices = global_indices[mask] - start
+                return local_indices.to(torch.int64), mask
+            else:
+                # Replicated 1D
+                return global_indices.to(torch.int64), torch.ones(global_indices.shape, dtype=torch.bool, device=global_indices.device)
+
+        elif len(global_shape) == 2:
+            # 2D tensor (weight matrix)
+            out_dim, in_dim = global_shape
+
+            if partition_dim == 0:
+                # ColumnParallel: partition along output dim (rows)
+                shard_out = out_dim // tp_size
+
+                # Convert flat index to (row, col)
+                rows = global_indices // in_dim
+                cols = global_indices % in_dim
+
+                # Determine which TP rank each index belongs to
+                tp_ranks = rows // shard_out
+
+                # Filter indices belonging to this rank
+                mask = (tp_ranks == tp_rank)
+                my_rows = rows[mask]
+                my_cols = cols[mask]
+
+                # Compute local indices
+                local_rows = my_rows - tp_rank * shard_out
+                local_indices = local_rows * in_dim + my_cols
+
+                return local_indices.to(torch.int64), mask
+
+            elif partition_dim == 1:
+                # RowParallel: partition along input dim (columns)
+                shard_in = in_dim // tp_size
+
+                # Convert flat index to (row, col)
+                rows = global_indices // in_dim
+                cols = global_indices % in_dim
+
+                # Determine which TP rank each index belongs to
+                tp_ranks = cols // shard_in
+
+                # Filter indices belonging to this rank
+                mask = (tp_ranks == tp_rank)
+                my_rows = rows[mask]
+                my_cols = cols[mask]
+
+                # Compute local indices (local tensor has shape [out_dim, shard_in])
+                local_cols = my_cols - tp_rank * shard_in
+                local_indices = my_rows * shard_in + local_cols
+
+                return local_indices.to(torch.int64), mask
+
+            else:
+                # Replicated
+                return global_indices.to(torch.int64), torch.ones(global_indices.shape, dtype=torch.bool, device=global_indices.device)
+        else:
+            # Higher-dimensional tensor: flatten and treat as 1D
+            logger.warning(f"Unsupported tensor shape {global_shape}, treating as replicated")
+            return global_indices.to(torch.int64), torch.ones(global_indices.shape, dtype=torch.bool, device=global_indices.device)
+
+    def get_param_sample_hashes(
+        self,
+        param_names: List[str],
+        sample_indices: List[List[int]] = None,
+    ) -> dict:
+        """
+        Compute sampling hashes for specified parameters (for delta sync verification).
+
+        For each parameter, samples 3 fixed regions and computes a BITWISE hash.
+        Uses int16 view -> int32 sum for deterministic, collision-resistant hashing.
+        Returns dict mapping param_name -> {shape, hash, sample_values, tp_rank, sample_indices}.
+
+        Args:
+            param_names: List of HF parameter names to verify
+            sample_indices: Optional list of sample indices per param.
+                           If None, uses default sampling (start, middle, end).
+
+        Returns:
+            Dict mapping param_name -> verification info
+        """
+        params_dict = dict(self.model.named_parameters())
+        results = {}
+
+        for i, name in enumerate(param_names):
+            if name not in params_dict:
+                continue
+
+            param = params_dict[name]
+            flat_param = param.view(-1)
+            numel = flat_param.numel()
+
+            # Default sampling: 3 regions (start, middle, end), 10 elements each
+            if sample_indices is not None and i < len(sample_indices):
+                indices = sample_indices[i]
+            else:
+                sample_size = min(10, numel // 3)
+                indices = []
+                # Start region
+                indices.extend(range(0, sample_size))
+                # Middle region
+                mid_start = numel // 2 - sample_size // 2
+                indices.extend(range(mid_start, mid_start + sample_size))
+                # End region
+                indices.extend(range(numel - sample_size, numel))
+
+            # Filter valid indices
+            indices = [idx for idx in indices if 0 <= idx < numel]
+            if not indices:
+                continue
+
+            indices_tensor = torch.tensor(indices, dtype=torch.int64, device=param.device)
+            sample_values = flat_param[indices_tensor]
+
+            # BITWISE hash: view as int16, sum as int32 (deterministic, no float issues)
+            # bf16 is 16-bit, so view as int16 is safe
+            sample_int16 = sample_values.view(torch.int16)
+            hash_value = sample_int16.to(torch.int32).sum().item()
+
+            # Also store raw bits for debugging (first 5)
+            sample_bits = sample_int16[:5].cpu().tolist() if len(sample_int16) >= 5 else sample_int16.cpu().tolist()
+
+            results[name] = {
+                "shape": tuple(param.shape),
+                "hash": hash_value,
+                "sample_bits": sample_bits,  # Raw int16 bits for debug
+                "sample_indices": indices[:10],  # First 10 indices for debug
+                "tp_rank": self.tp_rank,
+                "numel": numel,
+            }
+
+        return results
+
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())

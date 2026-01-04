@@ -1180,6 +1180,49 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateWeightsFromDeltaReqInput(BaseReq):
+    """Update model weights from sparse delta updates.
+
+    This is more efficient than full weight replacement when only a small
+    fraction of elements have changed (e.g., in RL training scenarios).
+
+    - serialized_delta_chunks: List of serialized (param_name, indices, values) tuples
+    - Each tp_rank receives its own pre-mapped local indices
+    """
+
+    serialized_delta_chunks: List[Union[str, bytes]]
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class UpdateWeightsFromDeltaReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class GetParamSampleHashesReqInput(BaseReq):
+    """Get sampling hashes for specified parameters (for delta sync verification).
+
+    Used to verify correctness of delta weight sync by comparing hashes
+    between Slime (Megatron) and SGLang.
+    """
+    # List of HF parameter names to verify
+    param_names: List[str]
+
+
+@dataclass
+class GetParamSampleHashesReqOutput(BaseReq):
+    """Response containing sampling hashes for each parameter."""
+    # Dict mapping param_name -> {shape, hash, sample_values, tp_rank, numel}
+    # One entry per tp_rank
+    hashes_by_rank: List[dict]
+
+
+@dataclass
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     # The master address
     master_address: str
