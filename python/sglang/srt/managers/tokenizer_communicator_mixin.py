@@ -421,6 +421,11 @@ class TokenizerCommunicatorMixin:
                 result = (await self.update_weights_from_distributed_communicator(obj))[
                     0
                 ]
+                if result.success and obj.weight_version is not None:
+                    self._update_weight_version_if_provided(obj.weight_version)
+                    result.message += (
+                        f" Weight version updated to {obj.weight_version}."
+                    )
                 return result.success, result.message
 
         # This means that weight sync
@@ -480,6 +485,11 @@ class TokenizerCommunicatorMixin:
         async with self.is_pause_cond:
             if self.is_pause:
                 result = (await self.update_weights_from_tensor_communicator(obj))[0]
+                if result.success and obj.weight_version is not None:
+                    self._update_weight_version_if_provided(obj.weight_version)
+                    result.message += (
+                        f" Weight version updated to {obj.weight_version}."
+                    )
                 return result.success, result.message
 
         # This means that weight sync

@@ -667,6 +667,7 @@ class DeepseekV2MoE(nn.Module):
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
@@ -2641,7 +2642,11 @@ class DeepseekV2AttentionMLA(nn.Module):
         ):
             k = k_nope.new_empty(*k_shape)
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
-        elif _is_cuda:
+        elif _is_cuda and all(
+            # (i.bit_count() == 1) == (is_power_of_two(i))
+            i.bit_count() == 1
+            for i in (k_shape[1], k_nope.shape[-1], k_pe.shape[-1])
+        ):
             # fa3 mha support fp8 inputs
             if (
                 self.current_attention_backend == "fa3"
