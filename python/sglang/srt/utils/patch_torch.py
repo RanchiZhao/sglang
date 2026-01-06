@@ -48,9 +48,12 @@ _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
-    output_args = _modify_tuple(
-        output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
-    )
+    # Only modify CUDA tensors (they have device index at position 6)
+    # CPU tensors have a different format and don't need UUID modification
+    if len(output_args) > _REDUCE_TENSOR_ARG_DEVICE_INDEX:
+        output_args = _modify_tuple(
+            output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
+        )
     return output_fn, output_args
 
 
