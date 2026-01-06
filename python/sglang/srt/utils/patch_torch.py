@@ -74,7 +74,9 @@ def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
         for device in range(torch.cuda.device_count()):
             if str(torch.cuda.get_device_properties(device).uuid) == device_maybe_uuid:
                 return device
-        raise Exception("Invalid device_uuid=" + device_maybe_uuid)
+        # UUID not found - use current device for cross-node weight sync
+        # This happens when weight data is serialized on one node and deserialized on another
+        return torch.cuda.current_device()
 
     raise Exception(f"Unknown type: {device_maybe_uuid=}")
 

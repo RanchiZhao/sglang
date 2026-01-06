@@ -176,17 +176,8 @@ class BaseTpWorker(ABC):
             # Old format: 64 copies, take the one for this tp_rank (for backward compatibility)
             serialized = serialized_data[self.tp_rank]
 
-        # Deserialize: check for "TORCH:" prefix (cross-node compatible format)
-        if isinstance(serialized, str) and serialized.startswith("TORCH:"):
-            import io
-            import pybase64
-            data = pybase64.b64decode(serialized[6:], validate=True)
-            named_tensors = torch.load(io.BytesIO(data), weights_only=False)
-        else:
-            named_tensors = MultiprocessingSerializer.deserialize(serialized)
-
         success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
+            named_tensors=MultiprocessingSerializer.deserialize(serialized),
             load_format=recv_req.load_format,
         )
         return success, message
