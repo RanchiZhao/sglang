@@ -48,12 +48,9 @@ _REDUCE_TENSOR_ARG_DEVICE_INDEX = 6
 
 def _reduce_tensor_modified(*args, **kwargs):
     output_fn, output_args = reductions._reduce_tensor_original(*args, **kwargs)
-    # Only modify CUDA tensors (they have device index at position 6)
-    # CPU tensors have a different format and don't need UUID modification
-    if len(output_args) > _REDUCE_TENSOR_ARG_DEVICE_INDEX:
-        output_args = _modify_tuple(
-            output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
-        )
+    output_args = _modify_tuple(
+        output_args, _REDUCE_TENSOR_ARG_DEVICE_INDEX, _device_to_uuid
+    )
     return output_fn, output_args
 
 
@@ -74,9 +71,7 @@ def _device_from_maybe_uuid(device_maybe_uuid: Union[int, str]) -> int:
         for device in range(torch.cuda.device_count()):
             if str(torch.cuda.get_device_properties(device).uuid) == device_maybe_uuid:
                 return device
-        # UUID not found - use current device for cross-node weight sync
-        # This happens when weight data is serialized on one node and deserialized on another
-        return torch.cuda.current_device()
+        raise Exception("Invalid device_uuid=" + device_maybe_uuid)
 
     raise Exception(f"Unknown type: {device_maybe_uuid=}")
 
