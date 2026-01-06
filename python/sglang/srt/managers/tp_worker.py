@@ -162,14 +162,44 @@ class BaseTpWorker(ABC):
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
+        import os
+        import time
+        profile_enabled = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
+
+        if profile_enabled:
+            t_start = time.time()
 
         monkey_patch_torch_reductions()
+
+        if profile_enabled:
+            t_deserialize_start = time.time()
+
+        named_tensors = MultiprocessingSerializer.deserialize(
+            recv_req.serialized_named_tensors[self.tp_rank]
+        )
+
+        if profile_enabled:
+            deserialize_time = time.time() - t_deserialize_start
+            t_load_start = time.time()
+
         success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
-            ),
+            named_tensors=named_tensors,
             load_format=recv_req.load_format,
         )
+
+        if profile_enabled:
+            load_time = time.time() - t_load_start
+            total_time = time.time() - t_start
+            # Only log from tp_rank 0 to reduce noise
+            if self.tp_rank == 0:
+                print(
+                    f"[SGLang Profile] tp_rank={self.tp_rank} "
+                    f"deserialize={deserialize_time*1000:.1f}ms "
+                    f"load_weights={load_time*1000:.1f}ms "
+                    f"total={total_time*1000:.1f}ms",
+                    flush=True
+                )
+
         return success, message
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
