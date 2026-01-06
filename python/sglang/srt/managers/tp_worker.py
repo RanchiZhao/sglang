@@ -192,13 +192,21 @@ class BaseTpWorker(ABC):
             total_time = time.time() - t_start
             # Only log from tp_rank 0 to reduce noise
             if self.tp_rank == 0:
-                print(
+                log_msg = (
                     f"[SGLang Profile] tp_rank={self.tp_rank} "
                     f"deserialize={deserialize_time*1000:.1f}ms "
                     f"load_weights={load_time*1000:.1f}ms "
-                    f"total={total_time*1000:.1f}ms",
-                    flush=True
+                    f"total={total_time*1000:.1f}ms"
                 )
+                print(log_msg, flush=True)
+                # Also write to shared storage for reliability
+                try:
+                    with open("/mnt/hisys-data/yqzhao/sglang_profile.log", "a") as f:
+                        f.write(log_msg + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                except Exception:
+                    pass
 
         return success, message
 
