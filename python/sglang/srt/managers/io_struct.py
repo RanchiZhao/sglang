@@ -1185,6 +1185,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Deep profiling: submit timestamp for Ray latency measurement
+    _submit_ts: Optional[float] = None
 
 
 @dataclass

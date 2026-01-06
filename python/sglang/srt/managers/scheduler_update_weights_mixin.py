@@ -87,7 +87,25 @@ class SchedulerUpdateWeightsMixin:
         import os
         import time
         profile_enabled = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
-        
+        deep_profile_enabled = os.environ.get("SLIME_DEEP_PROFILE", "0") == "1"
+
+        # Deep profiling: measure Ray latency from submit timestamp
+        if deep_profile_enabled and hasattr(recv_req, '_submit_ts') and recv_req._submit_ts:
+            ray_latency = time.time() - recv_req._submit_ts
+            try:
+                if torch.distributed.get_rank(group=self.tp_cpu_group) == 0:
+                    log_msg = f"[Ray Latency] {ray_latency*1000:.1f}ms"
+                    print(log_msg, flush=True)
+                    try:
+                        with open("/mnt/hisys-data/yqzhao/deep_profile.log", "a") as f:
+                            f.write(log_msg + "\n")
+                            f.flush()
+                            os.fsync(f.fileno())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         if profile_enabled:
             t_start = time.time()
         

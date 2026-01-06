@@ -1312,12 +1312,14 @@ class ModelRunner:
     ):
         """Handle flattened bucket format for weight updates"""
         import os
+        import socket
         import time
         profile_enabled = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
-        
-        if profile_enabled:
+        deep_profile_enabled = os.environ.get("SLIME_DEEP_PROFILE", "0") == "1"
+
+        if profile_enabled or deep_profile_enabled:
             t_start = time.time()
-        
+
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
         metadata = flattened_tensor_bucket_dict["metadata"]
 
@@ -1373,6 +1375,44 @@ class ModelRunner:
                         os.fsync(f.fileno())
                 except Exception:
                     pass
+
+        # Deep profiling: collect per-worker timing for barrier analysis
+        if deep_profile_enabled:
+            total_time = time.time() - t_start
+            my_data = {
+                'rank': self.tp_rank,
+                'time': total_time,
+                'host': socket.gethostname()
+            }
+            # Collect timing from all workers
+            world_size = torch.distributed.get_world_size(self.tp_group.device_group)
+            all_data = [None] * world_size
+            try:
+                torch.distributed.all_gather_object(all_data, my_data, group=self.tp_group.device_group)
+
+                if self.tp_rank == 0:
+                    # Filter out None values and sort by time
+                    valid_data = [d for d in all_data if d is not None]
+                    if len(valid_data) > 0:
+                        valid_data.sort(key=lambda x: x['time'], reverse=True)
+                        slowest = valid_data[0]
+                        fastest = valid_data[-1]
+                        gap = slowest['time'] - fastest['time']
+                        log_msg = (
+                            f"[Barrier Deep] slow=rank{slowest['rank']}@{slowest['host']}:{slowest['time']*1000:.0f}ms "
+                            f"fast=rank{fastest['rank']}:{fastest['time']*1000:.0f}ms gap={gap*1000:.0f}ms"
+                        )
+                        print(log_msg, flush=True)
+                        try:
+                            with open("/mnt/hisys-data/yqzhao/deep_profile.log", "a") as f:
+                                f.write(log_msg + "\n")
+                                f.flush()
+                                os.fsync(f.fileno())
+                        except Exception:
+                            pass
+            except Exception as e:
+                if self.tp_rank == 0:
+                    print(f"[Barrier Deep] Error collecting worker timing: {e}", flush=True)
 
         return True, "Success"
 
