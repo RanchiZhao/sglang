@@ -164,10 +164,20 @@ class BaseTpWorker(ABC):
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 
         monkey_patch_torch_reductions()
+
+        # Optimization: After Slime's PP/EP/TP communication, all data is identical.
+        # So we only receive ONE copy instead of 64 identical copies.
+        # All TP workers use the same data; load_weights() will shard by tp_rank internally.
+        serialized_data = recv_req.serialized_named_tensors
+        if len(serialized_data) == 1:
+            # New format: single copy of weights (optimized)
+            serialized = serialized_data[0]
+        else:
+            # Old format: 64 copies, take the one for this tp_rank (for backward compatibility)
+            serialized = serialized_data[self.tp_rank]
+
         success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=MultiprocessingSerializer.deserialize(
-                recv_req.serialized_named_tensors[self.tp_rank]
-            ),
+            named_tensors=MultiprocessingSerializer.deserialize(serialized),
             load_format=recv_req.load_format,
         )
         return success, message
