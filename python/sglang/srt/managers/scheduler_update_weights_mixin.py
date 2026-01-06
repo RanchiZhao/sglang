@@ -84,8 +84,21 @@ class SchedulerUpdateWeightsMixin:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        import os
+        import time
+        profile_enabled = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
+        
+        if profile_enabled:
+            t_start = time.time()
+        
+        # [6.1] Worker processing
         worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_tensor(recv_req)
+        
+        if profile_enabled:
+            worker_time = time.time() - t_start
+            t_barrier_start = time.time()
+        
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             if recv_req.flush_cache:
@@ -93,7 +106,33 @@ class SchedulerUpdateWeightsMixin:
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
+        
+        # [6.2] TP Barrier - wait for all workers to finish
         torch.distributed.barrier(group=self.tp_cpu_group)
+        
+        if profile_enabled:
+            barrier_time = time.time() - t_barrier_start
+            total_time = time.time() - t_start
+            # Only print from rank 0 scheduler to reduce noise
+            try:
+                if torch.distributed.get_rank(group=self.tp_cpu_group) == 0:
+                    log_msg = (
+                        f"[SGLang Scheduler Profile] worker={worker_time*1000:.1f}ms "
+                        f"barrier={barrier_time*1000:.1f}ms total={total_time*1000:.1f}ms"
+                    )
+                    print(log_msg, flush=True)
+                    # Also write to shared storage for reliability
+                    try:
+                        with open("/mnt/hisys-data/yqzhao/sglang_profile.log", "a") as f:
+                            f.write(log_msg + "\n")
+                            f.flush()
+                            os.fsync(f.fileno())
+                    except Exception:
+                        pass
+            except Exception:
+                # Fallback if group rank check fails
+                pass
+        
         return UpdateWeightsFromTensorReqOutput(success, message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):

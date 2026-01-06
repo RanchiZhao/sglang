@@ -1311,10 +1311,17 @@ class ModelRunner:
         flattened_tensor_bucket_dict,
     ):
         """Handle flattened bucket format for weight updates"""
+        import os
+        import time
+        profile_enabled = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
+        
+        if profile_enabled:
+            t_start = time.time()
+        
         flattened_tensor = flattened_tensor_bucket_dict["flattened_tensor"]
         metadata = flattened_tensor_bucket_dict["metadata"]
 
-        # Convert metadata dict to our format
+        # [8.1] Convert metadata dict to our format
         converted_metadata = []
         for meta in metadata:
             converted_meta = FlattenedTensorMetadata(
@@ -1327,14 +1334,45 @@ class ModelRunner:
             )
             converted_metadata.append(converted_meta)
 
-        # Create bucket and reconstruct tensors
+        if profile_enabled:
+            metadata_time = time.time() - t_start
+            tensor_count = len(converted_metadata)
+            total_bytes = sum(meta.numel * flattened_tensor.element_size() for meta in converted_metadata)
+            total_mb = total_bytes / (1024 * 1024)
+            t_reconstruct_start = time.time()
+
+        # [8.2] Create bucket and reconstruct tensors
         bucket = FlattenedTensorBucket(
             flattened_tensor=flattened_tensor, metadata=converted_metadata
         )
         reconstructed_tensors = bucket.reconstruct_tensors()
 
-        # Load the reconstructed tensors using the standard method
+        if profile_enabled:
+            reconstruct_time = time.time() - t_reconstruct_start
+            t_load_start = time.time()
+
+        # [8.3] Load the reconstructed tensors using the standard method
         self.model.load_weights(reconstructed_tensors)
+
+        if profile_enabled:
+            load_time = time.time() - t_load_start
+            total_time = time.time() - t_start
+            # Only log from tp_rank 0 to reduce noise
+            if self.tp_rank == 0:
+                log_msg = (
+                    f"[ModelRunner Profile] n_tensors={tensor_count} data_mb={total_mb:.1f} "
+                    f"metadata={metadata_time*1000:.1f}ms reconstruct={reconstruct_time*1000:.1f}ms "
+                    f"load_weights={load_time*1000:.1f}ms total={total_time*1000:.1f}ms"
+                )
+                print(log_msg, flush=True)
+                # Also write to shared storage for reliability
+                try:
+                    with open("/mnt/hisys-data/yqzhao/sglang_profile.log", "a") as f:
+                        f.write(log_msg + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                except Exception:
+                    pass
 
         return True, "Success"
 
