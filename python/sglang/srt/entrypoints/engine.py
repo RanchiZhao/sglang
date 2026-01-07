@@ -486,23 +486,32 @@ class Engine(EngineBase):
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
+        named_tensors: List[Tuple[str, torch.Tensor]] = None,
         load_format: Optional[str] = None,
         flush_cache: bool = True,
+        # Additional params for Slime integration
+        serialized_named_tensors: List = None,
+        weight_version: Optional[str] = None,
+        _submit_ts: Optional[float] = None,
     ):
         """Update weights from distributed source. If there are going to be more updates, set `flush_cache` to be false
         to avoid duplicated cache cleaning operation."""
-        if load_format == "flattened_bucket":
-            serialized_named_tensors = named_tensors
+        # Support both named_tensors (original) and serialized_named_tensors (Slime)
+        if serialized_named_tensors is not None:
+            tensors_to_use = serialized_named_tensors
+        elif load_format == "flattened_bucket":
+            tensors_to_use = named_tensors
         else:
-            serialized_named_tensors = [
+            tensors_to_use = [
                 MultiprocessingSerializer.serialize(named_tensors)
                 for _ in range(self.server_args.tp_size)
             ]
         obj = UpdateWeightsFromTensorReqInput(
-            serialized_named_tensors=serialized_named_tensors,
+            serialized_named_tensors=tensors_to_use,
             load_format=load_format,
             flush_cache=flush_cache,
+            weight_version=weight_version,
+            _submit_ts=_submit_ts,
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_tensor(obj, None)
