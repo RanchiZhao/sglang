@@ -1376,43 +1376,14 @@ class ModelRunner:
                 except Exception:
                     pass
 
-        # Deep profiling: collect per-worker timing for barrier analysis
-        if deep_profile_enabled:
+        # Deep profiling: just log local timing, don't use all_gather_object
+        # (all_gather_object per chunk is too expensive - 317 chunks × 64 workers sync)
+        # The barrier timing is already collected at scheduler level
+        if deep_profile_enabled and self.tp_rank == 0:
             total_time = time.time() - t_start
-            my_data = {
-                'rank': self.tp_rank,
-                'time': total_time,
-                'host': socket.gethostname()
-            }
-            # Collect timing from all workers
-            world_size = torch.distributed.get_world_size(self.tp_group.device_group)
-            all_data = [None] * world_size
-            try:
-                torch.distributed.all_gather_object(all_data, my_data, group=self.tp_group.device_group)
-
-                if self.tp_rank == 0:
-                    # Filter out None values and sort by time
-                    valid_data = [d for d in all_data if d is not None]
-                    if len(valid_data) > 0:
-                        valid_data.sort(key=lambda x: x['time'], reverse=True)
-                        slowest = valid_data[0]
-                        fastest = valid_data[-1]
-                        gap = slowest['time'] - fastest['time']
-                        log_msg = (
-                            f"[Barrier Deep] slow=rank{slowest['rank']}@{slowest['host']}:{slowest['time']*1000:.0f}ms "
-                            f"fast=rank{fastest['rank']}:{fastest['time']*1000:.0f}ms gap={gap*1000:.0f}ms"
-                        )
-                        print(log_msg, flush=True)
-                        try:
-                            with open("/mnt/hisys-data/yqzhao/deep_profile.log", "a") as f:
-                                f.write(log_msg + "\n")
-                                f.flush()
-                                os.fsync(f.fileno())
-                        except Exception:
-                            pass
-            except Exception as e:
-                if self.tp_rank == 0:
-                    print(f"[Barrier Deep] Error collecting worker timing: {e}", flush=True)
+            # Only log if unusually slow (> 50ms) to reduce noise
+            if total_time > 0.05:
+                print(f"[ModelRunner Deep] tp_rank=0 load_time={total_time*1000:.1f}ms", flush=True)
 
         return True, "Success"
 
