@@ -233,8 +233,17 @@ class BaseTpWorker(ABC):
         # Get THIS worker's gpu_identity (not scheduler's!)
         hostname = socket.gethostname()
         device_id = self.model_runner.device
-        if hasattr(device_id, 'index'):
+        # Handle different device_id types: torch.device, str ("cuda:0"), or int
+        import torch
+        if isinstance(device_id, torch.device):
             device_id = device_id.index
+        elif isinstance(device_id, str):
+            # Parse "cuda:0" -> 0
+            if ':' in device_id:
+                device_id = int(device_id.split(':')[1])
+            else:
+                device_id = int(device_id)
+        # else: assume it's already an int
         gpu_identity = f"{hostname}_{device_id}"
 
         key = f"weights_{gpu_identity}_v{recv_req.weight_version}_c{recv_req.chunk_id}"
