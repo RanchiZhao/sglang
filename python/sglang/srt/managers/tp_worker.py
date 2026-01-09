@@ -253,19 +253,27 @@ class BaseTpWorker(ABC):
             data_len = struct.unpack("!I", binary[:4])[0]
             return pickle.loads(binary[4 : 4 + data_len])
 
-        def ms_get_object(addr, key, timeout=60):
-            """Get object from MetaServer with retry"""
-            for attempt in range(10):
+        def ms_get_object(addr, key, timeout=60, max_retries=120):
+            """Get object from MetaServer with retry.
+
+            P2P mode: Slime PUT may take time, so we wait patiently.
+            Default: 120 retries * 0.5s = 60s max wait.
+            """
+            for attempt in range(max_retries):
                 try:
                     resp = requests.get(f"http://{addr}/v1/get_binary/{key}", timeout=timeout)
                     if resp.status_code == 404:
-                        raise ValueError(f"Key '{key}' not found")
+                        # Key not ready yet, wait and retry
+                        if attempt < max_retries - 1:
+                            time.sleep(0.5)
+                            continue
+                        raise ValueError(f"Key '{key}' not found after {max_retries} retries")
                     resp.raise_for_status()
                     return from_binary(resp.content)
-                except Exception as e:
-                    if attempt == 9:
+                except requests.exceptions.RequestException as e:
+                    if attempt == max_retries - 1:
                         raise
-                    time.sleep(1)
+                    time.sleep(0.5)
             return None
 
         # GET IPC handles from MetaServer using THIS worker's gpu_identity
