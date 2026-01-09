@@ -102,6 +102,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromMetaserverReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
@@ -891,6 +892,28 @@ async def update_weights_from_ipc(obj: UpdateWeightsFromIPCReqInput, request: Re
     if success:
         if _global_state.tokenizer_manager.initial_weights_loaded is False:
             _global_state.tokenizer_manager.initial_weights_loaded = True
+        return ORJSONResponse(content)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/update_weights_from_metaserver")
+async def update_weights_from_metaserver(
+    obj: UpdateWeightsFromMetaserverReqInput, request: Request
+):
+    """Update weights via MetaServer P2P path.
+
+    Each worker fetches IPC handles from MetaServer using its own gpu_identity.
+    This eliminates Gloo gather and Ray payload overhead for weight sync.
+    """
+    success, message = (
+        await _global_state.tokenizer_manager.update_weights_from_metaserver(
+            obj, request
+        )
+    )
+
+    content = {"success": success, "message": message}
+    if success:
         return ORJSONResponse(content)
     else:
         return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)

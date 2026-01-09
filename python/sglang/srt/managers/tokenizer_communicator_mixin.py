@@ -69,6 +69,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    UpdateWeightsFromMetaserverReqInput,
+    UpdateWeightsFromMetaserverReqOutput,
 )
 from sglang.srt.server_args import LoRARef, ServerArgs
 from sglang.srt.utils import get_bool_env_var
@@ -176,6 +178,9 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_ipc_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.update_weights_from_metaserver_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.get_weights_by_name_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -248,6 +253,10 @@ class TokenizerCommunicatorMixin:
                 (
                     UpdateWeightsFromIPCReqOutput,
                     self.update_weights_from_ipc_communicator.handle_recv,
+                ),
+                (
+                    UpdateWeightsFromMetaserverReqOutput,
+                    self.update_weights_from_metaserver_communicator.handle_recv,
                 ),
                 (
                     GetWeightsByNameReqOutput,
@@ -529,6 +538,33 @@ class TokenizerCommunicatorMixin:
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
             message += f" Weight version updated to {obj.weight_version}."
+
+        return success, message
+
+    async def update_weights_from_metaserver(
+        self,
+        obj: UpdateWeightsFromMetaserverReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Update weights via MetaServer P2P path.
+
+        Each worker fetches IPC handles from MetaServer using its own gpu_identity.
+        This eliminates Gloo gather and Ray payload overhead.
+        """
+        self.auto_create_handle_loop()
+        try:
+            # MetaServer P2P works with any dp_size since each worker fetches independently
+            logger.info(
+                f"Starting MetaServer P2P weight update: chunk={obj.chunk_id} version={obj.weight_version}"
+            )
+            # This means that weight sync cannot run while requests are in progress.
+            async with self.model_update_lock.writer_lock:
+                result = (await self.update_weights_from_metaserver_communicator(obj))[0]
+                success, message = result.success, result.message
+        except Exception as e:
+            error_msg = f"MetaServer P2P weight update failed: {str(e)}"
+            logger.error(error_msg)
+            success, message = False, error_msg
 
         return success, message
 
