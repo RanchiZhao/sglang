@@ -34,7 +34,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
-    UpdateWeightsFromMetaserverReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -163,193 +162,20 @@ class BaseTpWorker(ABC):
         return success, message
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
-        import os
-        import time
-        profile_enabled = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
-
-        if profile_enabled:
-            t_start = time.time()
 
         monkey_patch_torch_reductions()
-
-        if profile_enabled:
-            t_deserialize_start = time.time()
-
-        named_tensors = MultiprocessingSerializer.deserialize(
-            recv_req.serialized_named_tensors[self.tp_rank]
-        )
-
-        if profile_enabled:
-            deserialize_time = time.time() - t_deserialize_start
-            t_load_start = time.time()
-
         success, message = self.model_runner.update_weights_from_tensor(
-            named_tensors=named_tensors,
+            named_tensors=MultiprocessingSerializer.deserialize(
+                recv_req.serialized_named_tensors[self.tp_rank]
+            ),
             load_format=recv_req.load_format,
         )
-
-        if profile_enabled:
-            load_time = time.time() - t_load_start
-            total_time = time.time() - t_start
-            # Only log from tp_rank 0 to reduce noise
-            if self.tp_rank == 0:
-                log_msg = (
-                    f"[SGLang Profile] tp_rank={self.tp_rank} "
-                    f"deserialize={deserialize_time*1000:.1f}ms "
-                    f"load_weights={load_time*1000:.1f}ms "
-                    f"total={total_time*1000:.1f}ms"
-                )
-                print(log_msg, flush=True)
-                # Also write to shared storage for reliability
-                try:
-                    with open("/mnt/hisys-data/yqzhao/sglang_profile.log", "a") as f:
-                        f.write(log_msg + "\n")
-                        f.flush()
-                        os.fsync(f.fileno())
-                except Exception:
-                    pass
-
         return success, message
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""
         success, message = self.model_runner.update_weights_from_ipc(recv_req)
         return success, message
-
-    def update_weights_from_metaserver(self, recv_req: UpdateWeightsFromMetaserverReqInput):
-        """
-        Update weights from MetaServer P2P path.
-
-        Each TpWorker fetches IPC handles from MetaServer using its own gpu_identity
-        (hostname_deviceid), ensuring CUDA IPC locality.
-        """
-        import os
-        import pickle
-        import socket
-        import struct
-        import time
-
-        import requests
-
-        profile_enabled = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
-        if profile_enabled:
-            t_start = time.time()
-
-        # Ensure torch reductions patch is applied before deserializing CUDA IPC handles
-        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
-        monkey_patch_torch_reductions()
-
-        # Get THIS worker's gpu_identity using GPU UUID (physical device identifier)
-        # This matches the UUID embedded in CUDA IPC handles by patch_torch
-        import torch
-        device_id = torch.cuda.current_device()
-        gpu_uuid = str(torch.cuda.get_device_properties(device_id).uuid)
-
-        # DEBUG: Log for troubleshooting IPC issues
-        import socket
-        hostname = socket.gethostname()
-        logger.info(
-            f"[MetaServer P2P DEBUG] SGLang hostname={hostname}, "
-            f"device_id={device_id}, gpu_uuid={gpu_uuid}"
-        )
-
-        gpu_identity = gpu_uuid  # Use UUID instead of hostname_deviceid
-
-        key = f"weights_{gpu_identity}_v{recv_req.weight_version}_c{recv_req.chunk_id}"
-        meta_server_addr = recv_req.meta_server_addr
-
-        def from_binary(binary):
-            data_len = struct.unpack("!I", binary[:4])[0]
-            return pickle.loads(binary[4 : 4 + data_len])
-
-        def ms_get_object(addr, key, timeout=60, max_retries=120):
-            """Get object from MetaServer with retry.
-
-            P2P mode: Slime PUT may take time, so we wait patiently.
-            Default: 120 retries * 0.5s = 60s max wait.
-            """
-            for attempt in range(max_retries):
-                try:
-                    resp = requests.get(f"http://{addr}/v1/get_binary/{key}", timeout=timeout)
-                    if resp.status_code == 404:
-                        # Key not ready yet, wait and retry
-                        if attempt < max_retries - 1:
-                            time.sleep(0.5)
-                            continue
-                        raise ValueError(f"Key '{key}' not found after {max_retries} retries")
-                    resp.raise_for_status()
-                    return from_binary(resp.content)
-                except requests.exceptions.RequestException as e:
-                    if attempt == max_retries - 1:
-                        raise
-                    time.sleep(0.5)
-            return None
-
-        # GET IPC handles from MetaServer using THIS worker's gpu_identity
-        if profile_enabled:
-            t_get_start = time.time()
-
-        # Log the key we're trying to GET
-        logger.info(
-            f"[MetaServer P2P GET] Attempting key={key} from addr={meta_server_addr}"
-        )
-
-        chunk_data = ms_get_object(meta_server_addr, key, timeout=60)
-        if chunk_data is None:
-            return False, f"Failed to get chunk data from MetaServer: {key}"
-
-        # Log successful GET
-        logger.info(
-            f"[MetaServer P2P GET] Success key={key}, got {len(chunk_data.get('serialized_tensors', []))} tensors"
-        )
-
-        if profile_enabled:
-            get_time = time.time() - t_get_start
-            t_deser_start = time.time()
-
-        serialized_tensors = chunk_data.get("serialized_tensors", [])
-        load_format = chunk_data.get("load_format", recv_req.load_format)
-
-        # Process each dtype's serialized data
-        deser_time = 0.0
-        load_time = 0.0
-        for serialized_data in serialized_tensors:
-            # Deserialize IPC handles to get tensors
-            if profile_enabled:
-                t_d = time.time()
-            named_tensors = MultiprocessingSerializer.deserialize(serialized_data)
-            if profile_enabled:
-                deser_time += time.time() - t_d
-                t_l = time.time()
-
-            # Load weights to model_runner
-            success, message = self.model_runner.update_weights_from_tensor(
-                named_tensors=named_tensors,
-                load_format=load_format,
-            )
-            if profile_enabled:
-                load_time += time.time() - t_l
-            if not success:
-                return False, message
-
-        if profile_enabled:
-            total_time = time.time() - t_start
-            # Only log from one worker to reduce noise (device 0)
-            if device_id == 0:
-                log_msg = (
-                    f"[SGLang P2P Profile] chunk={recv_req.chunk_id} "
-                    f"http_get={get_time*1000:.1f}ms deser={deser_time*1000:.1f}ms "
-                    f"load={load_time*1000:.1f}ms total={total_time*1000:.1f}ms"
-                )
-                print(log_msg, flush=True)
-                try:
-                    with open("/mnt/hisys-data/yqzhao/sglang_p2p_profile.log", "a") as f:
-                        f.write(log_msg + "\n")
-                        f.flush()
-                except Exception:
-                    pass
-
-        return True, f"Success: chunk={recv_req.chunk_id} gpu={gpu_identity}"
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.model_runner.get_weights_by_name(

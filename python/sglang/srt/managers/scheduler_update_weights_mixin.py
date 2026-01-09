@@ -37,10 +37,6 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    UpdateWeightsFromAwexReqInput,
-    UpdateWeightsFromAwexReqOutput,
-    UpdateWeightsFromMetaserverReqInput,
-    UpdateWeightsFromMetaserverReqOutput,
 )
 
 if TYPE_CHECKING:
@@ -88,39 +84,8 @@ class SchedulerUpdateWeightsMixin:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
-        import os
-        import time
-        profile_enabled = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
-        deep_profile_enabled = os.environ.get("SLIME_DEEP_PROFILE", "0") == "1"
-
-        # Deep profiling: measure Ray latency from submit timestamp
-        if deep_profile_enabled and hasattr(recv_req, '_submit_ts') and recv_req._submit_ts:
-            ray_latency = time.time() - recv_req._submit_ts
-            try:
-                if torch.distributed.get_rank(group=self.tp_cpu_group) == 0:
-                    log_msg = f"[Ray Latency] {ray_latency*1000:.1f}ms"
-                    print(log_msg, flush=True)
-                    try:
-                        with open("/mnt/hisys-data/yqzhao/deep_profile.log", "a") as f:
-                            f.write(log_msg + "\n")
-                            f.flush()
-                            os.fsync(f.fileno())
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        if profile_enabled:
-            t_start = time.time()
-        
-        # [6.1] Worker processing
         worker = self.draft_worker or self.tp_worker
         success, message = worker.update_weights_from_tensor(recv_req)
-        
-        if profile_enabled:
-            worker_time = time.time() - t_start
-            t_barrier_start = time.time()
-        
         # TODO extract common code b/t update_weights_from_distributed and update_weights_from_tensor later
         if success:
             if recv_req.flush_cache:
@@ -128,33 +93,7 @@ class SchedulerUpdateWeightsMixin:
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        
-        # [6.2] TP Barrier - wait for all workers to finish
         torch.distributed.barrier(group=self.tp_cpu_group)
-        
-        if profile_enabled:
-            barrier_time = time.time() - t_barrier_start
-            total_time = time.time() - t_start
-            # Only print from rank 0 scheduler to reduce noise
-            try:
-                if torch.distributed.get_rank(group=self.tp_cpu_group) == 0:
-                    log_msg = (
-                        f"[SGLang Scheduler Profile] worker={worker_time*1000:.1f}ms "
-                        f"barrier={barrier_time*1000:.1f}ms total={total_time*1000:.1f}ms"
-                    )
-                    print(log_msg, flush=True)
-                    # Also write to shared storage for reliability
-                    try:
-                        with open("/mnt/hisys-data/yqzhao/sglang_profile.log", "a") as f:
-                            f.write(log_msg + "\n")
-                            f.flush()
-                            os.fsync(f.fileno())
-                    except Exception:
-                        pass
-            except Exception:
-                # Fallback if group rank check fails
-                pass
-        
         return UpdateWeightsFromTensorReqOutput(success, message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
@@ -276,137 +215,6 @@ class SchedulerUpdateWeightsMixin:
             max_size=params["max_size"],
         )
 
-    # Awex integration methods
-    _awex_receiver = None  # Initialized at scheduler startup if enabled
-
-    def _init_awex_receiver(self: Scheduler):
-        """
-        Initialize awex receiver if enabled.
-
-        IMPORTANT: This must be called during Scheduler.__init__ (not lazily)
-        because the awex reader.initialize() registers 'num_infer_engines' to
-        MetaServer, which the training side waits for before sending weights.
-
-        Only tp_rank == 0 AND node_rank == 0 schedulers need to register.
-        """
-        if self._awex_receiver is not None:
-            return
-
-        try:
-            from sglang.srt.managers.awex_integration import (
-                AwexWeightReceiver,
-                is_awex_enabled,
-            )
-        except ImportError as e:
-            logger.debug(f"[Scheduler] awex integration not available: {e}")
-            return
-
-        if not is_awex_enabled(self.server_args):
-            return
-
-        # Only tp_rank == 0 AND node_rank == 0 needs to initialize
-        # (registers num_infer_engines to MetaServer)
-        node_rank = getattr(self.server_args, "node_rank", 0)
-        tp_rank = getattr(self, "tp_rank", 0)
-        if node_rank != 0 or tp_rank != 0:
-            logger.info(
-                f"[Scheduler] Skipping awex init for node_rank={node_rank}, tp_rank={tp_rank}"
-            )
-            return
-
-        logger.info(
-            f"[Scheduler] Awex enabled, creating receiver (node_rank=0, tp_rank=0)..."
-        )
-
-        try:
-            self._awex_receiver = AwexWeightReceiver(self, self.server_args)
-            logger.info("[Scheduler] Awex receiver created, initializing...")
-
-            # Initialize immediately to register num_infer_engines with MetaServer
-            self._awex_receiver.initialize()
-            logger.info("[Scheduler] Awex receiver initialized and registered with MetaServer")
-        except Exception as e:
-            logger.error(f"[Scheduler] Failed to initialize awex receiver: {e}")
-            import traceback
-            traceback.print_exc()
-            self._awex_receiver = None
-            raise
-
-    def update_weights_from_awex(
-        self: Scheduler, recv_req: UpdateWeightsFromAwexReqInput
-    ) -> UpdateWeightsFromAwexReqOutput:
-        """
-        Receive and update weights via awex optimized path.
-
-        This method replaces the baseline chunk-based update with a single
-        awex call that handles the entire weight transfer efficiently.
-
-        Expected savings: ~12s (Ray round-trip overhead elimination)
-        """
-        self._init_awex_receiver()
-
-        if self._awex_receiver is None:
-            msg = "Awex receiver not initialized - is enable_awex set?"
-            logger.error(msg)
-            return UpdateWeightsFromAwexReqOutput(success=False, message=msg)
-
-        try:
-            # Flush cache before receiving new weights
-            if recv_req.flush_cache:
-                self.flush_cache()
-
-            # Receive weights via awex
-            success = self._awex_receiver.receive_weights(recv_req.step_id)
-
-            # Barrier to ensure all workers have received weights
-            torch.distributed.barrier(group=self.tp_cpu_group)
-
-            return UpdateWeightsFromAwexReqOutput(
-                success=success,
-                message="Success" if success else "Failed to receive weights",
-            )
-        except Exception as e:
-            logger.error(f"[Scheduler] Failed to update weights from awex: {e}")
-            return UpdateWeightsFromAwexReqOutput(success=False, message=str(e))
-
-    def update_weights_from_metaserver(
-        self: Scheduler, recv_req: UpdateWeightsFromMetaserverReqInput
-    ) -> UpdateWeightsFromMetaserverReqOutput:
-        """
-        Receive and update weights via MetaServer P2P path.
-
-        Each TpWorker:
-        1. Gets its own gpu_identity (hostname_deviceid) - NOT scheduler's!
-        2. Fetches IPC handles from MetaServer using that identity
-        3. Deserializes and loads weights
-
-        This ensures CUDA IPC handles are used on the correct physical GPU.
-        """
-        try:
-            # Flush cache if requested
-            if recv_req.flush_cache:
-                self.flush_cache()
-
-            # Delegate to TpWorker - it has the correct gpu_identity
-            worker = self.draft_worker or self.tp_worker
-            success, message = worker.update_weights_from_metaserver(recv_req)
-
-            if not success:
-                logger.error(f"[MetaServer P2P] Worker failed: {message}")
-
-            # TP barrier to ensure all workers have received weights
-            torch.distributed.barrier(group=self.tp_cpu_group)
-
-            return UpdateWeightsFromMetaserverReqOutput(
-                success=success,
-                message=message,
-            )
-        except Exception as e:
-            logger.error(f"[MetaServer P2P] Failed to update weights: {e}")
-            import traceback
-            traceback.print_exc()
-            return UpdateWeightsFromMetaserverReqOutput(success=False, message=str(e))
-
 
 def _export_static_state(model):
     return dict(
@@ -420,4 +228,3 @@ def _import_static_state(model, static_params):
     self_named_buffers = dict(model.named_buffers())
     for name, tensor in static_params["buffers"]:
         self_named_buffers[name][...] = tensor
-

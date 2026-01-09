@@ -1185,62 +1185,10 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # Deep profiling: submit timestamp for Ray latency measurement
-    _submit_ts: Optional[float] = None
 
 
 @dataclass
 class UpdateWeightsFromTensorReqOutput(BaseReq):
-    success: bool
-    message: str
-
-
-@dataclass
-class UpdateWeightsFromAwexReqInput(BaseReq):
-    """Update model weights via awex optimized path.
-
-    This request triggers the awex-based weight synchronization which
-    eliminates the 317 chunk loop overhead by using a single batch transfer.
-    """
-
-    # Training step ID
-    step_id: int
-    # Whether to flush cache after update
-    flush_cache: bool = True
-
-
-@dataclass
-class UpdateWeightsFromAwexReqOutput(BaseReq):
-    """Response for awex weight update request."""
-
-    success: bool
-    message: str
-
-
-@dataclass
-class UpdateWeightsFromMetaserverReqInput(BaseReq):
-    """Update model weights via MetaServer P2P path.
-
-    Each worker fetches IPC handles from MetaServer using its own gpu_identity.
-    This eliminates Gloo gather and Ray payload overhead.
-    """
-
-    # Chunk index
-    chunk_id: int
-    # Weight version number
-    weight_version: int
-    # MetaServer address (ip:port)
-    meta_server_addr: str
-    # Weight load format
-    load_format: str = "flattened_bucket"
-    # Whether to flush cache after update
-    flush_cache: bool = False
-
-
-@dataclass
-class UpdateWeightsFromMetaserverReqOutput(BaseReq):
-    """Response for MetaServer P2P weight update request."""
-
     success: bool
     message: str
 
