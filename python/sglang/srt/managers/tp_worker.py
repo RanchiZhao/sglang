@@ -223,12 +223,17 @@ class BaseTpWorker(ABC):
         Each TpWorker fetches IPC handles from MetaServer using its own gpu_identity
         (hostname_deviceid), ensuring CUDA IPC locality.
         """
+        import os
         import pickle
         import socket
         import struct
         import time
 
         import requests
+
+        profile_enabled = os.environ.get("SLIME_BASELINE_PROFILE", "0") == "1"
+        if profile_enabled:
+            t_start = time.time()
 
         # Ensure torch reductions patch is applied before deserializing CUDA IPC handles
         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
@@ -281,25 +286,58 @@ class BaseTpWorker(ABC):
             return None
 
         # GET IPC handles from MetaServer using THIS worker's gpu_identity
+        if profile_enabled:
+            t_get_start = time.time()
+
         chunk_data = ms_get_object(meta_server_addr, key, timeout=60)
         if chunk_data is None:
             return False, f"Failed to get chunk data from MetaServer: {key}"
+
+        if profile_enabled:
+            get_time = time.time() - t_get_start
+            t_deser_start = time.time()
 
         serialized_tensors = chunk_data.get("serialized_tensors", [])
         load_format = chunk_data.get("load_format", recv_req.load_format)
 
         # Process each dtype's serialized data
+        deser_time = 0.0
+        load_time = 0.0
         for serialized_data in serialized_tensors:
             # Deserialize IPC handles to get tensors
+            if profile_enabled:
+                t_d = time.time()
             named_tensors = MultiprocessingSerializer.deserialize(serialized_data)
+            if profile_enabled:
+                deser_time += time.time() - t_d
+                t_l = time.time()
 
             # Load weights to model_runner
             success, message = self.model_runner.update_weights_from_tensor(
                 named_tensors=named_tensors,
                 load_format=load_format,
             )
+            if profile_enabled:
+                load_time += time.time() - t_l
             if not success:
                 return False, message
+
+        if profile_enabled:
+            total_time = time.time() - t_start
+            # Only log from one worker to reduce noise (device 0)
+            if device_id == 0:
+                log_msg = (
+                    f"[SGLang P2P Profile] chunk={recv_req.chunk_id} "
+                    f"http_get={get_time*1000:.1f}ms deser={deser_time*1000:.1f}ms "
+                    f"load={load_time*1000:.1f}ms total={total_time*1000:.1f}ms"
+                )
+                print(log_msg, flush=True)
+                try:
+                    with open("/mnt/hisys-data/yqzhao/sglang_p2p_profile.log", "a") as f:
+                        f.write(log_msg + "\n")
+                        f.flush()
+                except Exception:
+                    pass
 
         return True, f"Success: chunk={recv_req.chunk_id} gpu={gpu_identity}"
 
