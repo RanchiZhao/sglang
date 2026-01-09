@@ -251,6 +251,16 @@ class BaseTpWorker(ABC):
                 # "cuda" without index, fallback to current device
                 device_id = torch.cuda.current_device()
         # else: assume it's already an int
+
+        # DEBUG: Log identity info for troubleshooting IPC issues
+        cuda_current = torch.cuda.current_device()
+        logger.info(
+            f"[MetaServer P2P DEBUG] hostname={hostname}, "
+            f"model_runner.device={self.model_runner.device}, "
+            f"parsed_device_id={device_id}, "
+            f"cuda.current_device()={cuda_current}"
+        )
+
         gpu_identity = f"{hostname}_{device_id}"
 
         key = f"weights_{gpu_identity}_v{recv_req.weight_version}_c{recv_req.chunk_id}"
