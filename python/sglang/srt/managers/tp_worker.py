@@ -234,34 +234,21 @@ class BaseTpWorker(ABC):
         from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
         monkey_patch_torch_reductions()
 
-        # Get THIS worker's gpu_identity (not scheduler's!)
-        hostname = socket.gethostname()
-        device_id = self.model_runner.device
-        # Handle different device_id types: torch.device, str ("cuda:0", "cuda"), or int
+        # Get THIS worker's gpu_identity using GPU UUID (physical device identifier)
+        # This matches the UUID embedded in CUDA IPC handles by patch_torch
         import torch
-        if isinstance(device_id, torch.device):
-            device_id = device_id.index if device_id.index is not None else torch.cuda.current_device()
-        elif isinstance(device_id, str):
-            # Parse "cuda:0" -> 0, "cuda" -> current_device
-            if ':' in device_id:
-                device_id = int(device_id.split(':')[1])
-            elif device_id.isdigit():
-                device_id = int(device_id)
-            else:
-                # "cuda" without index, fallback to current device
-                device_id = torch.cuda.current_device()
-        # else: assume it's already an int
+        device_id = torch.cuda.current_device()
+        gpu_uuid = str(torch.cuda.get_device_properties(device_id).uuid)
 
-        # DEBUG: Log identity info for troubleshooting IPC issues
-        cuda_current = torch.cuda.current_device()
+        # DEBUG: Log for troubleshooting IPC issues
+        import socket
+        hostname = socket.gethostname()
         logger.info(
-            f"[MetaServer P2P DEBUG] hostname={hostname}, "
-            f"model_runner.device={self.model_runner.device}, "
-            f"parsed_device_id={device_id}, "
-            f"cuda.current_device()={cuda_current}"
+            f"[MetaServer P2P DEBUG] SGLang hostname={hostname}, "
+            f"device_id={device_id}, gpu_uuid={gpu_uuid}"
         )
 
-        gpu_identity = f"{hostname}_{device_id}"
+        gpu_identity = gpu_uuid  # Use UUID instead of hostname_deviceid
 
         key = f"weights_{gpu_identity}_v{recv_req.weight_version}_c{recv_req.chunk_id}"
         meta_server_addr = recv_req.meta_server_addr
