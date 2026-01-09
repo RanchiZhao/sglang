@@ -230,6 +230,10 @@ class BaseTpWorker(ABC):
 
         import requests
 
+        # Ensure torch reductions patch is applied before deserializing CUDA IPC handles
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+        monkey_patch_torch_reductions()
+
         # Get THIS worker's gpu_identity (not scheduler's!)
         hostname = socket.gethostname()
         device_id = self.model_runner.device
