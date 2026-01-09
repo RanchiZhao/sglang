@@ -589,6 +589,29 @@ class Scheduler(
             ]
         )
 
+        # Init awex integration at the very end (if enabled)
+        # This must happen after all other initialization is complete
+        # Only node_rank == 0 needs to register with MetaServer
+        try:
+            self._init_awex_receiver()
+        except Exception as e:
+            # Log error with full traceback for debugging
+            import traceback
+            logger.error(f"[Scheduler] Failed to init awex receiver: {e}")
+            logger.error(traceback.format_exc())
+            # Re-raise for node_rank == 0 since it's critical for registration
+            if getattr(self.server_args, "node_rank", 0) == 0:
+                raise
+
+        # Init MetaServer P2P listener at the very end (if enabled)
+        # NOTE: Disabled for Meta-Pipe - now using Ray-triggered updates instead of polling
+        # try:
+        #     self._init_metaserver_p2p_listener()
+        # except Exception as e:
+        #     import traceback
+        #     logger.error(f"[Scheduler] Failed to init MetaServer P2P listener: {e}")
+        #     logger.error(traceback.format_exc())
+
     def init_sockets(self, server_args: ServerArgs, port_args: PortArgs):
         context = zmq.Context(2)
         self.idle_sleeper = None
@@ -2211,7 +2234,7 @@ class Scheduler(
             self.running_batch.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
-            and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (not self.enable_overlap or not hasattr(self, 'result_queue') or len(self.result_queue) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
         )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:

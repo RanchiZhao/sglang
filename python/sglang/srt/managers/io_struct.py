@@ -1196,6 +1196,28 @@ class UpdateWeightsFromTensorReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateWeightsFromAwexReqInput(BaseReq):
+    """Update model weights via awex optimized path.
+
+    This request triggers the awex-based weight synchronization which
+    eliminates the 317 chunk loop overhead by using a single batch transfer.
+    """
+
+    # Training step ID
+    step_id: int
+    # Whether to flush cache after update
+    flush_cache: bool = True
+
+
+@dataclass
+class UpdateWeightsFromAwexReqOutput(BaseReq):
+    """Response for awex weight update request."""
+
+    success: bool
+    message: str
+
+
+@dataclass
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq):
     # The master address
     master_address: str

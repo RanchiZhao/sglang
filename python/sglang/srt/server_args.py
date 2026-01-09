@@ -254,6 +254,15 @@ class ServerArgs:
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
 
+    # Awex integration for optimized weight synchronization
+    enable_awex: bool = False
+    meta_server_addr: Optional[str] = None
+    enable_colocate_mode: bool = True
+    num_engines: int = 1  # Total number of inference engines in cluster
+    engine_rank: int = 0  # Rank of this inference engine (0-indexed)
+    # MetaServer P2P mode (alternative to awex)
+    enable_metaserver_p2p: bool = False
+
     # Quantization and data type
     dtype: str = "auto"
     quantization: Optional[str] = None
@@ -2240,6 +2249,38 @@ class ServerArgs:
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
+        )
+
+        # Awex integration for optimized weight synchronization
+        parser.add_argument(
+            "--enable-awex",
+            action="store_true",
+            default=False,
+            help="Enable awex optimized weight synchronization. "
+            "This eliminates the chunk loop overhead (317 chunks × 38.5ms = 12s+). "
+            "Requires --meta-server-addr to be set.",
+        )
+        parser.add_argument(
+            "--meta-server-addr",
+            type=str,
+            default=None,
+            help="MetaServer address for awex weight sync, format: 'ip:port'. "
+            "Required when --enable-awex is enabled. "
+            "Start MetaServer with: python /mnt/hisys-data/yqzhao/start_meta_server.py",
+        )
+        parser.add_argument(
+            "--enable-colocate-mode",
+            action="store_true",
+            default=True,
+            help="Enable awex colocate mode (training/inference share GPU). Default: True.",
+        )
+        parser.add_argument(
+            "--enable-metaserver-p2p",
+            action="store_true",
+            default=False,
+            help="Enable MetaServer P2P weight synchronization. "
+            "Each SGLang worker fetches weights by GPU identity (hostname_deviceid). "
+            "Requires --meta-server-addr to be set.",
         )
 
         # Quantization and data type
