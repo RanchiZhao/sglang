@@ -289,9 +289,19 @@ class BaseTpWorker(ABC):
         if profile_enabled:
             t_get_start = time.time()
 
+        # Log the key we're trying to GET
+        logger.info(
+            f"[MetaServer P2P GET] Attempting key={key} from addr={meta_server_addr}"
+        )
+
         chunk_data = ms_get_object(meta_server_addr, key, timeout=60)
         if chunk_data is None:
             return False, f"Failed to get chunk data from MetaServer: {key}"
+
+        # Log successful GET
+        logger.info(
+            f"[MetaServer P2P GET] Success key={key}, got {len(chunk_data.get('serialized_tensors', []))} tensors"
+        )
 
         if profile_enabled:
             get_time = time.time() - t_get_start
