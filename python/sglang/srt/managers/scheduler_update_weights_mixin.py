@@ -375,92 +375,37 @@ class SchedulerUpdateWeightsMixin:
         """
         Receive and update weights via MetaServer P2P path.
 
-        Each worker:
-        1. Gets its own gpu_identity (hostname_deviceid)
+        Each TpWorker:
+        1. Gets its own gpu_identity (hostname_deviceid) - NOT scheduler's!
         2. Fetches IPC handles from MetaServer using that identity
         3. Deserializes and loads weights
 
-        This is the HTTP-triggered version (vs. background listener).
+        This ensures CUDA IPC handles are used on the correct physical GPU.
         """
-        import pickle
-        import struct
-        import requests
-        import time
-
-        gpu_identity = self._get_gpu_identity()
-        key = f"weights_{gpu_identity}_v{recv_req.weight_version}_c{recv_req.chunk_id}"
-
-        # Parse MetaServer address
-        meta_server_addr = recv_req.meta_server_addr
-
-        def from_binary(binary):
-            data_len = struct.unpack("!I", binary[:4])[0]
-            return pickle.loads(binary[4 : 4 + data_len])
-
-        def ms_get_object(addr, key, timeout=60):
-            """Get object from MetaServer with retry"""
-            for attempt in range(10):
-                try:
-                    resp = requests.get(f"http://{addr}/v1/get_binary/{key}", timeout=timeout)
-                    if resp.status_code == 404:
-                        raise ValueError(f"Key '{key}' not found")
-                    resp.raise_for_status()
-                    return from_binary(resp.content)
-                except Exception as e:
-                    if attempt == 9:
-                        raise
-                    time.sleep(1)
-            return None
-
         try:
             # Flush cache if requested
             if recv_req.flush_cache:
                 self.flush_cache()
 
-            # GET IPC handles from MetaServer using OWN gpu_identity
-            chunk_data = ms_get_object(meta_server_addr, key, timeout=60)
-            if chunk_data is None:
-                raise RuntimeError(f"Failed to get chunk data from MetaServer: {key}")
+            # Delegate to TpWorker - it has the correct gpu_identity
+            worker = self.draft_worker or self.tp_worker
+            success, message = worker.update_weights_from_metaserver(recv_req)
 
-            serialized_tensors = chunk_data.get("serialized_tensors", [])
-            load_format = chunk_data.get("load_format", recv_req.load_format)
-            weight_version = chunk_data.get("weight_version", str(recv_req.weight_version))
-
-            # Process each dtype's serialized data
-            for serialized_data in serialized_tensors:
-                # Deserialize IPC handles to get tensors
-                from sglang.srt.weight_sync.utils import MultiprocessingSerializer
-
-                named_tensors = MultiprocessingSerializer.deserialize(serialized_data)
-
-                # Load weights directly to model_runner
-                success, message = self.tp_worker.model_runner.update_weights_from_tensor(
-                    named_tensors=named_tensors,
-                    load_format=load_format,
-                )
-                if not success:
-                    logger.error(f"[MetaServer P2P] Failed to load weights: {message}")
-                    return UpdateWeightsFromMetaserverReqOutput(success=False, message=message)
+            if not success:
+                logger.error(f"[MetaServer P2P] Worker failed: {message}")
 
             # TP barrier to ensure all workers have received weights
             torch.distributed.barrier(group=self.tp_cpu_group)
 
             return UpdateWeightsFromMetaserverReqOutput(
-                success=True,
-                message=f"Success: chunk={recv_req.chunk_id} version={recv_req.weight_version}",
+                success=success,
+                message=message,
             )
         except Exception as e:
             logger.error(f"[MetaServer P2P] Failed to update weights: {e}")
             import traceback
             traceback.print_exc()
             return UpdateWeightsFromMetaserverReqOutput(success=False, message=str(e))
-
-    def _get_gpu_identity(self: Scheduler) -> str:
-        """Get unique GPU identity: hostname_deviceid."""
-        import socket
-        hostname = socket.gethostname()
-        device_id = torch.cuda.current_device()
-        return f"{hostname}_{device_id}"
 
 
 def _export_static_state(model):

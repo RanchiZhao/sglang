@@ -34,6 +34,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromMetaserverReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -214,6 +215,72 @@ class BaseTpWorker(ABC):
         """Update weights from IPC for checkpoint-engine integration."""
         success, message = self.model_runner.update_weights_from_ipc(recv_req)
         return success, message
+
+    def update_weights_from_metaserver(self, recv_req: UpdateWeightsFromMetaserverReqInput):
+        """
+        Update weights from MetaServer P2P path.
+
+        Each TpWorker fetches IPC handles from MetaServer using its own gpu_identity
+        (hostname_deviceid), ensuring CUDA IPC locality.
+        """
+        import pickle
+        import socket
+        import struct
+        import time
+
+        import requests
+
+        # Get THIS worker's gpu_identity (not scheduler's!)
+        hostname = socket.gethostname()
+        device_id = self.model_runner.device
+        if hasattr(device_id, 'index'):
+            device_id = device_id.index
+        gpu_identity = f"{hostname}_{device_id}"
+
+        key = f"weights_{gpu_identity}_v{recv_req.weight_version}_c{recv_req.chunk_id}"
+        meta_server_addr = recv_req.meta_server_addr
+
+        def from_binary(binary):
+            data_len = struct.unpack("!I", binary[:4])[0]
+            return pickle.loads(binary[4 : 4 + data_len])
+
+        def ms_get_object(addr, key, timeout=60):
+            """Get object from MetaServer with retry"""
+            for attempt in range(10):
+                try:
+                    resp = requests.get(f"http://{addr}/v1/get_binary/{key}", timeout=timeout)
+                    if resp.status_code == 404:
+                        raise ValueError(f"Key '{key}' not found")
+                    resp.raise_for_status()
+                    return from_binary(resp.content)
+                except Exception as e:
+                    if attempt == 9:
+                        raise
+                    time.sleep(1)
+            return None
+
+        # GET IPC handles from MetaServer using THIS worker's gpu_identity
+        chunk_data = ms_get_object(meta_server_addr, key, timeout=60)
+        if chunk_data is None:
+            return False, f"Failed to get chunk data from MetaServer: {key}"
+
+        serialized_tensors = chunk_data.get("serialized_tensors", [])
+        load_format = chunk_data.get("load_format", recv_req.load_format)
+
+        # Process each dtype's serialized data
+        for serialized_data in serialized_tensors:
+            # Deserialize IPC handles to get tensors
+            named_tensors = MultiprocessingSerializer.deserialize(serialized_data)
+
+            # Load weights to model_runner
+            success, message = self.model_runner.update_weights_from_tensor(
+                named_tensors=named_tensors,
+                load_format=load_format,
+            )
+            if not success:
+                return False, message
+
+        return True, f"Success: chunk={recv_req.chunk_id} gpu={gpu_identity}"
 
     def get_weights_by_name(self, recv_req: GetWeightsByNameReqInput):
         parameter = self.model_runner.get_weights_by_name(
