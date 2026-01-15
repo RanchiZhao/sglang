@@ -15,6 +15,7 @@ class WeightChecker:
     def __init__(self, model_runner):
         self._model_runner = model_runner
         self._snapshot_tensors = None
+        self._golden_stats = None  # For golden standard comparison
 
     def handle(self, action: str):
         logger.info(f"[WeightChecker] handle action={action}")
@@ -24,6 +25,12 @@ class WeightChecker:
             self._reset_tensors()
         elif action == "compare":
             self._compare()
+        elif action == "dump_stats":
+            self._dump_stats()
+        elif action == "save_golden":
+            self._save_golden_stats()
+        elif action == "compare_golden":
+            self._compare_with_golden()
         else:
             raise Exception(f"Unsupported {action=}")
 
@@ -47,6 +54,109 @@ class WeightChecker:
             expect_tensors=_postprocess_tensors(self._snapshot_tensors),
             actual_tensors=_postprocess_tensors(dict(self._model_state())),
         )
+
+    def _dump_stats(self):
+        """Dump statistics for all model parameters for manual comparison."""
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        logger.info(f"[WeightChecker] Dumping weight statistics for rank {rank}")
+        for name, param in self._model_state():
+            t = param.data.float()
+            stats = {
+                "sum": t.sum().item(),
+                "mean": t.mean().item(),
+                "shape": list(param.shape),
+            }
+            # Log with clear format for easy grep and comparison
+            logger.info(
+                f"[WEIGHT_STATS] rank={rank} {name}: "
+                f"sum={stats['sum']:.6f} mean={stats['mean']:.9f} shape={stats['shape']}"
+            )
+
+    def _save_golden_stats(self):
+        """Save current weight statistics as golden standard for later comparison."""
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        logger.info(f"[WeightChecker] Saving golden weight statistics for rank {rank}")
+        self._golden_stats = {}
+        for name, param in self._model_state():
+            t = param.data.float()
+            self._golden_stats[name] = {
+                "sum": t.sum().item(),
+                "mean": t.mean().item(),
+                "shape": list(param.shape),
+            }
+        logger.info(f"[WeightChecker] Saved {len(self._golden_stats)} parameters as golden standard")
+
+    def _compare_with_golden(self):
+        """Compare current weights with saved golden standard.
+
+        This is the key method for TransferPlan verification:
+        1. Before AWEX sync: call save_golden to capture correct weights
+        2. After AWEX sync: call compare_golden to verify transfer correctness
+
+        If TransferPlan is correct, the weights should be nearly identical
+        (small differences due to training updates are expected).
+        """
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        if self._golden_stats is None:
+            logger.error("[WeightChecker] No golden stats saved. Call save_golden first.")
+            return
+
+        logger.info(f"[WeightChecker] Comparing with golden standard for rank {rank}")
+
+        mismatched_params = []
+        matched_params = []
+
+        for name, param in self._model_state():
+            if name not in self._golden_stats:
+                logger.warning(f"[GOLDEN_DIFF] rank={rank} {name}: NOT IN GOLDEN (new parameter)")
+                continue
+
+            t = param.data.float()
+            current_sum = t.sum().item()
+            current_mean = t.mean().item()
+
+            golden = self._golden_stats[name]
+            golden_sum = golden["sum"]
+            golden_mean = golden["mean"]
+
+            diff_sum = abs(current_sum - golden_sum)
+            diff_mean = abs(current_mean - golden_mean)
+
+            # Relative difference threshold (1% relative error or small absolute error)
+            rel_threshold = 0.01
+            abs_threshold = 1e-4
+
+            is_match = (
+                diff_sum < abs_threshold or
+                (golden_sum != 0 and diff_sum / abs(golden_sum) < rel_threshold)
+            )
+
+            if is_match:
+                matched_params.append(name)
+            else:
+                mismatched_params.append(name)
+                # Log detailed info for mismatched parameters
+                logger.error(
+                    f"[GOLDEN_DIFF] rank={rank} {name}: MISMATCH "
+                    f"golden_sum={golden_sum:.6f} current_sum={current_sum:.6f} diff_sum={diff_sum:.6f} | "
+                    f"golden_mean={golden_mean:.9f} current_mean={current_mean:.9f} diff_mean={diff_mean:.9f}"
+                )
+
+        # Summary
+        total = len(matched_params) + len(mismatched_params)
+        logger.info(
+            f"[WeightChecker] Golden comparison result for rank {rank}: "
+            f"{len(matched_params)}/{total} matched, {len(mismatched_params)} mismatched"
+        )
+
+        if len(mismatched_params) > 0:
+            logger.error(f"[WeightChecker] Mismatched parameters: {mismatched_params[:10]}...")  # Show first 10
 
     def _model_state(self):
         # TODO: support EAGLE etc (e.g. yield from both main model and draft model)

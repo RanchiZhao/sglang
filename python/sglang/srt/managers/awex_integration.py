@@ -115,9 +115,18 @@ class SGLangSchedulerAdapter:
         awex uses this to extract model parameter information. The function
         receives 'model' and 'model_context' as kwargs.
 
-        Returns a list with a single result (this scheduler's rank).
-        InferParamMetaResolver expects a list of dicts, one per rank.
+        In colocate mode, each scheduler only has its own rank's metadata.
+
+        IMPORTANT: In colocate mode with TP across multiple nodes, only node_rank=0
+        workers call this function, but the world_size includes all nodes.
+        Using all_gather_object would deadlock because non-node-0 workers never call it.
+
+        Solution: In colocate mode, return only local metadata. Each worker builds
+        its own partial view of the TransferPlan for its inbound transfers.
+        The training side broadcasts complete metadata to coordinate.
         """
+        import torch.distributed as dist
+
         try:
             model_runner = self._scheduler.tp_worker.model_runner
             model = model_runner.model
@@ -125,17 +134,46 @@ class SGLangSchedulerAdapter:
             # Build model_context with required info for awex
             model_context = self._build_model_context()
 
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            logger.info(f"[SGLangSchedulerAdapter] rank={rank} world_size={world_size} executing task function...")
+
             # Execute the function with model and context
             result = fn(model=model, model_context=model_context, **kwargs)
 
+            logger.info(f"[SGLangSchedulerAdapter] rank={rank} task function completed")
+
             # awex expects a list of results (one per rank)
-            # Since each scheduler handles one rank, wrap in list
+            # In colocate mode, we CAN'T use all_gather because only node_rank=0
+            # workers call this function, while world_size includes all nodes.
+            # Instead, return only local metadata wrapped in a list.
             if isinstance(result, dict) and "rank_info" in result:
-                return [result]
+                enable_colocate = getattr(self._server_args, "enable_colocate_mode", False)
+                if enable_colocate:
+                    # In colocate mode: return local-only metadata
+                    # Each worker will build its portion of the TransferPlan
+                    logger.info(
+                        f"[SGLangSchedulerAdapter] rank={rank} returning local metadata only (colocate mode)"
+                    )
+                    return [result]
+                elif dist.is_initialized() and world_size > 1:
+                    # Non-colocate mode: gather from all ranks as before
+                    logger.info(f"[SGLangSchedulerAdapter] rank={rank} starting all_gather_object (world_size={world_size})...")
+                    all_results = [None] * world_size
+                    dist.all_gather_object(all_results, result)
+                    logger.info(
+                        f"[SGLangSchedulerAdapter] rank={rank} gathered metadata from {len(all_results)} ranks"
+                    )
+                    return all_results
+                else:
+                    # Single rank: just return local result
+                    return [result]
             return result
 
         except Exception as e:
             logger.error(f"[SGLangSchedulerAdapter] execute_task_in_model_worker failed: {e}")
+            import traceback
+            traceback.print_exc()
             raise
 
     def _build_model_context(self):
@@ -256,6 +294,9 @@ class AwexWeightReceiver:
                 "enable_colocate_mode": getattr(
                     self._server_args, "enable_colocate_mode", True
                 ),
+                "awex_per_node_mode": getattr(
+                    self._server_args, "awex_per_node_mode", False
+                ),
                 "num_engines": getattr(self._server_args, "num_engines", 1),
                 "engine_rank": getattr(self._server_args, "engine_rank", 0),
                 "tp_size": getattr(self._server_args, "tp_size", 1),
@@ -276,7 +317,8 @@ class AwexWeightReceiver:
             }
 
             logger.info(f"[AwexWeightReceiver] Creating config: num_engines={config_dict['num_engines']}, "
-                       f"engine_rank={config_dict['engine_rank']}, node_rank={config_dict['node_rank']}")
+                       f"engine_rank={config_dict['engine_rank']}, node_rank={config_dict['node_rank']}, "
+                       f"awex_per_node_mode={config_dict['awex_per_node_mode']}")
             return InferenceConfig(**config_dict)
 
         except ImportError as e:

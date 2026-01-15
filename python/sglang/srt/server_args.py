@@ -260,6 +260,7 @@ class ServerArgs:
     enable_colocate_mode: bool = True
     num_engines: int = 1  # Total number of inference engines in cluster
     engine_rank: int = 0  # Rank of this inference engine (0-indexed)
+    awex_per_node_mode: bool = False  # Each engine independently handles weight updates in cross-node colocate mode
     # MetaServer P2P mode (alternative to awex)
     enable_metaserver_p2p: bool = False
 

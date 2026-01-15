@@ -546,23 +546,23 @@ class TokenizerCommunicatorMixin:
         obj: UpdateWeightsFromMetaserverReqInput,
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
-        """Update weights via MetaServer P2P path.
+        """Update weights via AWEX colocate mode.
 
-        Each worker fetches IPC handles from MetaServer using its own gpu_identity.
-        This eliminates Gloo gather and Ray payload overhead.
+        This method is called when training side triggers weight update via Ray.
+        The actual weight transfer happens through MetaServer + NCCL P2P.
         """
         self.auto_create_handle_loop()
         try:
-            # MetaServer P2P works with any dp_size since each worker fetches independently
+            # AWEX colocate mode: step_id is used for coordination
             logger.info(
-                f"Starting MetaServer P2P weight update: chunk={obj.chunk_id} version={obj.weight_version}"
+                f"Starting AWEX weight update: step={obj.step_id} version={obj.weight_version}"
             )
             # This means that weight sync cannot run while requests are in progress.
             async with self.model_update_lock.writer_lock:
                 result = (await self.update_weights_from_metaserver_communicator(obj))[0]
                 success, message = result.success, result.message
         except Exception as e:
-            error_msg = f"MetaServer P2P weight update failed: {str(e)}"
+            error_msg = f"AWEX weight update failed: {str(e)}"
             logger.error(error_msg)
             success, message = False, error_msg
 

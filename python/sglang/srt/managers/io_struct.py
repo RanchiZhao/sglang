@@ -1228,6 +1228,34 @@ class UpdateWeightsFromIPCReqOutput(BaseReq):
 
 
 @dataclass
+class UpdateWeightsFromAwexReqInput(BaseReq):
+    """Request to update weights via AWEX colocate mode.
+
+    AWEX uses MetaServer + NCCL P2P for efficient weight sync.
+    The training side puts IPC handles to MetaServer, and inference
+    side fetches them using the same step_id for coordination.
+    """
+
+    # Training step ID for coordination
+    step_id: int
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # Whether to flush cache after weight update
+    flush_cache: bool = True
+
+
+@dataclass
+class UpdateWeightsFromAwexReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+# Aliases for Metaserver naming convention
+UpdateWeightsFromMetaserverReqInput = UpdateWeightsFromAwexReqInput
+UpdateWeightsFromMetaserverReqOutput = UpdateWeightsFromAwexReqOutput
+
+
+@dataclass
 class InitWeightsSendGroupForRemoteInstanceReqOutput(BaseReq):
     success: bool
     message: str

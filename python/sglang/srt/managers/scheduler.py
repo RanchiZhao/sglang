@@ -112,6 +112,7 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromAwexReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
@@ -538,6 +539,11 @@ class Scheduler(
         # Init overlap
         self.init_overlap()
 
+        # Init AWEX receiver for optimized weight synchronization
+        self._awex_receiver = None
+        if getattr(server_args, "enable_awex", False):
+            self._init_awex_receiver(server_args)
+
         # Init mlp sync flag
         self.require_mlp_sync = require_mlp_sync(server_args)
 
@@ -570,6 +576,7 @@ class Scheduler(
                 ),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
+                (UpdateWeightsFromAwexReqInput, self.update_weights_from_awex),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
                 (ReleaseMemoryOccupationReqInput, self.release_memory_occupation),
                 (ResumeMemoryOccupationReqInput, self.resume_memory_occupation),
@@ -962,6 +969,32 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _init_awex_receiver(self, server_args):
+        """Initialize AWEX weight receiver for optimized weight synchronization.
+
+        AWEX uses MetaServer + NCCL P2P for efficient weight transfer from
+        training to inference, replacing the baseline Gloo gather + Ray approach.
+        """
+        try:
+            from sglang.srt.managers.awex_integration import AwexWeightReceiver
+
+            logger.info(f"[AWEX] Initializing weight receiver on rank {self.tp_rank}")
+            self._awex_receiver = AwexWeightReceiver(
+                scheduler=self,
+                server_args=server_args,
+            )
+            # Initialize and register with MetaServer
+            self._awex_receiver.initialize()
+            logger.info(f"[AWEX] Weight receiver initialized successfully on rank {self.tp_rank}")
+        except ImportError as e:
+            logger.error(f"[AWEX] Failed to import awex_integration: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"[AWEX] Failed to initialize weight receiver: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+
     def init_moe_config(self):
         if hasattr(self.model_config.hf_config, "num_experts_per_tok"):
             initialize_moe_config(self.server_args)
@@ -1176,11 +1209,32 @@ class Scheduler(
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
             # If it is a health check generation request and there are running requests, ignore it.
-            if is_health_check_generate_req(recv_req) and (
+            # Note: In AWEX colocate mode, offload_tags being set is normal (waiting for weights)
+            # so we should still allow health checks through to keep the server responsive.
+            is_awex_colocate_mode = hasattr(self, "_awex_receiver") and self._awex_receiver is not None
+
+            # In AWEX colocate mode with offloaded weights, send abort response for health checks
+            # to update the heartbeat without actually running inference
+            if (is_awex_colocate_mode
+                and len(self.offload_tags) > 0
+                and is_health_check_generate_req(recv_req)):
+                # Send a simple abort response to acknowledge the health check
+                # This updates the heartbeat and keeps the server responsive
+                from sglang.srt.managers.io_struct import AbortReq
+                abort_output = AbortReq(
+                    abort_message="Server is waiting for training weights (AWEX colocate mode)",
+                    rid=recv_req.rid
+                )
+                self.send_to_tokenizer.send_output(abort_output, recv_req)
+                continue
+
+            should_skip_health_check = is_health_check_generate_req(recv_req) and (
                 self.chunked_req is not None
                 or not self.running_batch.is_empty()
-                or len(self.offload_tags) > 0
-            ):
+                # Only skip for offload_tags if NOT in AWEX colocate mode
+                or (len(self.offload_tags) > 0 and not is_awex_colocate_mode)
+            )
+            if should_skip_health_check:
                 self.return_health_check_ct += 1
                 continue
 
@@ -2211,7 +2265,7 @@ class Scheduler(
             self.running_batch.is_empty()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (self.cur_batch is None or self.cur_batch.is_empty())
-            and (not self.enable_overlap or len(self.result_queue) == 0)
+            and (not self.enable_overlap or len(getattr(self, 'result_queue', [])) == 0)
             and (self.pp_size == 1 or all(x.is_empty() for x in self.running_mbs))
         )
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
