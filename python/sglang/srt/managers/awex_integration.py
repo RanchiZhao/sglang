@@ -115,15 +115,19 @@ class SGLangSchedulerAdapter:
         awex uses this to extract model parameter information. The function
         receives 'model' and 'model_context' as kwargs.
 
-        In colocate mode, each scheduler only has its own rank's metadata.
+        Metadata collection strategy depends on awex_per_node_mode:
 
-        IMPORTANT: In colocate mode with TP across multiple nodes, only node_rank=0
-        workers call this function, but the world_size includes all nodes.
-        Using all_gather_object would deadlock because non-node-0 workers never call it.
+        1. awex_per_node_mode=True (recommended for multi-node colocate):
+           - All workers initialize WeightsReader
+           - All workers call this function
+           - All workers participate in all_gather → get global metadata
+           - TransferPlan can be built with full information
 
-        Solution: In colocate mode, return only local metadata. Each worker builds
-        its own partial view of the TransferPlan for its inbound transfers.
-        The training side broadcasts complete metadata to coordinate.
+        2. awex_per_node_mode=False (default, legacy):
+           - Only node_rank=0 workers initialize WeightsReader
+           - Only those workers call this function
+           - Cannot do all_gather (other workers don't participate → deadlock)
+           - Return local metadata only, TransferPlan is partial
         """
         import torch.distributed as dist
 
@@ -144,20 +148,37 @@ class SGLangSchedulerAdapter:
             logger.info(f"[SGLangSchedulerAdapter] rank={rank} task function completed")
 
             # awex expects a list of results (one per rank)
-            # In colocate mode, we CAN'T use all_gather because only node_rank=0
-            # workers call this function, while world_size includes all nodes.
-            # Instead, return only local metadata wrapped in a list.
             if isinstance(result, dict) and "rank_info" in result:
                 enable_colocate = getattr(self._server_args, "enable_colocate_mode", False)
-                if enable_colocate:
-                    # In colocate mode: return local-only metadata
-                    # Each worker will build its portion of the TransferPlan
+                awex_per_node_mode = getattr(self._server_args, "awex_per_node_mode", False)
+
+                if enable_colocate and awex_per_node_mode:
+                    # Per-node mode: ALL workers participate, can do all_gather
+                    # This gives us global metadata for proper TransferPlan construction
+                    if dist.is_initialized() and world_size > 1:
+                        logger.info(
+                            f"[SGLangSchedulerAdapter] rank={rank} starting all_gather_object "
+                            f"(colocate + per_node_mode, world_size={world_size})..."
+                        )
+                        all_results = [None] * world_size
+                        dist.all_gather_object(all_results, result)
+                        logger.info(
+                            f"[SGLangSchedulerAdapter] rank={rank} gathered metadata from {len(all_results)} ranks"
+                        )
+                        return all_results
+                    else:
+                        return [result]
+                elif enable_colocate:
+                    # Legacy colocate mode (per_node_mode=False):
+                    # Only node_rank=0 workers call this, cannot do all_gather
+                    # Return local metadata only - TransferPlan will be partial
                     logger.info(
-                        f"[SGLangSchedulerAdapter] rank={rank} returning local metadata only (colocate mode)"
+                        f"[SGLangSchedulerAdapter] rank={rank} returning local metadata only "
+                        f"(colocate mode, per_node_mode=False)"
                     )
                     return [result]
                 elif dist.is_initialized() and world_size > 1:
-                    # Non-colocate mode: gather from all ranks as before
+                    # Non-colocate mode: all workers participate, do all_gather
                     logger.info(f"[SGLangSchedulerAdapter] rank={rank} starting all_gather_object (world_size={world_size})...")
                     all_results = [None] * world_size
                     dist.all_gather_object(all_results, result)
@@ -310,6 +331,8 @@ class AwexWeightReceiver:
                 "enable_dp_attention": getattr(self._server_args, "enable_dp_attention", False),
                 "enable_dp_lm_head": getattr(self._server_args, "enable_dp_lm_head", False),
                 "moe_dense_tp_size": getattr(self._server_args, "moe_dense_tp_size", 1),
+                # MoE A2A backend for shared_experts sharding (deepep/mooncake = NO_SHARDING)
+                "moe_a2a_backend": getattr(self._server_args, "moe_a2a_backend", "none"),
                 # Additional fields needed by WeightsReader
                 "weights_exchange_ipc_backend": "cuda",
                 "weights_validation_steps": 0,
