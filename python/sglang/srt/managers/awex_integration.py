@@ -306,6 +306,10 @@ class AwexWeightReceiver:
                 "node_rank": getattr(self._server_args, "node_rank", 0),
                 "local_rank": getattr(self._scheduler, "gpu_id", 0),
                 "comm_backend": "nccl",  # Use NCCL for optimized transfer
+                # DP attention and LM head config (critical for sharding strategy!)
+                "enable_dp_attention": getattr(self._server_args, "enable_dp_attention", False),
+                "enable_dp_lm_head": getattr(self._server_args, "enable_dp_lm_head", False),
+                "moe_dense_tp_size": getattr(self._server_args, "moe_dense_tp_size", 1),
                 # Additional fields needed by WeightsReader
                 "weights_exchange_ipc_backend": "cuda",
                 "weights_validation_steps": 0,
@@ -318,7 +322,9 @@ class AwexWeightReceiver:
 
             logger.info(f"[AwexWeightReceiver] Creating config: num_engines={config_dict['num_engines']}, "
                        f"engine_rank={config_dict['engine_rank']}, node_rank={config_dict['node_rank']}, "
-                       f"awex_per_node_mode={config_dict['awex_per_node_mode']}")
+                       f"awex_per_node_mode={config_dict['awex_per_node_mode']}, "
+                       f"enable_dp_attention={config_dict['enable_dp_attention']}, "
+                       f"enable_dp_lm_head={config_dict['enable_dp_lm_head']}")
             return InferenceConfig(**config_dict)
 
         except ImportError as e:
