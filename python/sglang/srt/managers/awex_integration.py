@@ -115,31 +115,74 @@ class SGLangSchedulerAdapter:
         awex uses this to extract model parameter information. The function
         receives 'model' and 'model_context' as kwargs.
 
-        Metadata collection strategy depends on awex_per_node_mode:
+        Metadata collection strategy:
 
-        1. awex_per_node_mode=True (recommended for multi-node colocate):
-           - All workers initialize WeightsReader
-           - All workers call this function
-           - All workers participate in all_gather → get global metadata
-           - TransferPlan can be built with full information
+        1. If pre-collected global metadata exists (from TpModelWorker initialization):
+           - Return the pre-collected metadata directly
+           - This avoids the all_gather deadlock issue
 
-        2. awex_per_node_mode=False (default, legacy):
-           - Only node_rank=0 workers initialize WeightsReader
-           - Only those workers call this function
-           - Cannot do all_gather (other workers don't participate → deadlock)
-           - Return local metadata only, TransferPlan is partial
+        2. Otherwise, fall back to previous behavior:
+           - awex_per_node_mode=True: return local metadata only
+           - awex_per_node_mode=False: return local metadata only
+           - Non-colocate mode: do all_gather if possible
         """
         import torch.distributed as dist
 
         try:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+            # Check if we have pre-collected global metadata
+            # This is collected during TpModelWorker initialization when all workers are synchronized
+            pre_collected_meta = self._scheduler.tp_worker.get_awex_global_params_meta()
+
+            enable_colocate = getattr(self._server_args, "enable_colocate_mode", False)
+
+            if pre_collected_meta is not None and len(pre_collected_meta) > 0:
+                # Check if the pre-collected metadata is valid (not basic fallback)
+                first_meta = pre_collected_meta[0] if pre_collected_meta else None
+                is_valid = (
+                    first_meta is not None
+                    and isinstance(first_meta, dict)
+                    and "rank_info" in first_meta
+                    and not first_meta.get("_is_basic_meta", False)
+                )
+
+                if is_valid:
+                    # CRITICAL: In colocate mode, return ONLY current worker's metadata (1 entry)
+                    # This ensures AWEX uses _build_params_meta_from_local() which:
+                    # 1. Uses sharding strategy to infer global structure
+                    # 2. Generates virtual shards with global_rank = shard_idx (0 to num_shards-1)
+                    # 3. TransferPlan expects this virtual global_rank, not the true global rank
+                    #
+                    # If we return all 64 entries, AWEX would use _build_params_meta() which
+                    # stores the true global_rank (0-63), causing incorrect TransferPlan calculations.
+                    if enable_colocate and rank < len(pre_collected_meta):
+                        current_worker_meta = pre_collected_meta[rank]
+                        logger.info(
+                            f"[SGLangSchedulerAdapter] rank={rank} using pre-collected metadata "
+                            f"(returning ONLY current worker's metadata to trigger _build_params_meta_from_local)"
+                        )
+                        return [current_worker_meta]  # Return as list with 1 entry
+                    else:
+                        # Non-colocate mode: return all metadata
+                        logger.info(
+                            f"[SGLangSchedulerAdapter] rank={rank} using pre-collected global metadata "
+                            f"({len(pre_collected_meta)} workers)"
+                        )
+                        return pre_collected_meta
+
+            logger.info(
+                f"[SGLangSchedulerAdapter] rank={rank} no valid pre-collected metadata, "
+                f"falling back to normal execution..."
+            )
+
             model_runner = self._scheduler.tp_worker.model_runner
             model = model_runner.model
 
             # Build model_context with required info for awex
             model_context = self._build_model_context()
 
-            rank = dist.get_rank() if dist.is_initialized() else 0
-            world_size = dist.get_world_size() if dist.is_initialized() else 1
             logger.info(f"[SGLangSchedulerAdapter] rank={rank} world_size={world_size} executing task function...")
 
             # Execute the function with model and context
@@ -153,21 +196,20 @@ class SGLangSchedulerAdapter:
                 awex_per_node_mode = getattr(self._server_args, "awex_per_node_mode", False)
 
                 if enable_colocate and awex_per_node_mode:
-                    # Per-node mode: ALL workers participate, can do all_gather
-                    # This gives us global metadata for proper TransferPlan construction
-                    if dist.is_initialized() and world_size > 1:
-                        logger.info(
-                            f"[SGLangSchedulerAdapter] rank={rank} starting all_gather_object "
-                            f"(colocate + per_node_mode, world_size={world_size})..."
-                        )
-                        all_results = [None] * world_size
-                        dist.all_gather_object(all_results, result)
-                        logger.info(
-                            f"[SGLangSchedulerAdapter] rank={rank} gathered metadata from {len(all_results)} ranks"
-                        )
-                        return all_results
-                    else:
-                        return [result]
+                    # Per-node mode: each engine (Ray Actor) works INDEPENDENTLY
+                    # DO NOT do all_gather - it will DEADLOCK because:
+                    # 1. execute_task_in_model_worker runs on a SINGLE scheduler, not broadcasted
+                    # 2. all_gather_object needs ALL 64 workers to call it simultaneously
+                    # 3. But 8 engines are independent Ray Actors, calling at different times
+                    # 4. Engine 0's workers waiting for all_gather while Engine 1-7 are elsewhere
+                    #
+                    # Each engine uses its LOCAL metadata + sharding strategy to infer
+                    # the global structure in _build_params_meta_from_local()
+                    logger.info(
+                        f"[SGLangSchedulerAdapter] rank={rank} returning local metadata only "
+                        f"(colocate + per_node_mode, each engine independent, NO all_gather)"
+                    )
+                    return [result]
                 elif enable_colocate:
                     # Legacy colocate mode (per_node_mode=False):
                     # Only node_rank=0 workers call this, cannot do all_gather

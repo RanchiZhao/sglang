@@ -318,6 +318,13 @@ class TpModelWorker(BaseTpWorker):
         )[0]
         set_random_seed(self.random_seed)
 
+        # Pre-collect AWEX metadata if colocate mode is enabled
+        # This must happen when ALL workers are synchronized (right after broadcast_pyobj)
+        # All 64 workers participate in all_gather, avoiding the deadlock issue
+        self._awex_global_params_meta = None
+        if getattr(server_args, "enable_colocate_mode", False):
+            self._pre_collect_awex_metadata(server_args)
+
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
@@ -325,6 +332,226 @@ class TpModelWorker(BaseTpWorker):
     @property
     def model_runner(self) -> ModelRunner:
         return self._model_runner
+
+    def _pre_collect_awex_metadata(self, server_args):
+        """
+        Pre-collect AWEX metadata from ALL workers during initialization.
+
+        This method is called when all workers are synchronized (right after broadcast_pyobj).
+        It collects parameter metadata from each worker and does an all_gather to get
+        the global metadata from all 64 workers.
+
+        This solves the deadlock issue in execute_task_in_model_worker where only
+        some workers would call all_gather.
+
+        Args:
+            server_args: Server arguments containing configuration
+        """
+        import torch.distributed as dist
+        from sglang.srt.distributed import get_tp_group
+
+        try:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+            logger.info(
+                f"[AWEX_PRE_COLLECT] rank={rank} world_size={world_size} "
+                f"Starting AWEX metadata pre-collection..."
+            )
+
+            # Try to import AWEX and build proper metadata
+            try:
+                from awex.sharding.rank_info import RankInfo
+                from awex.models.registry import get_infer_weights_converter
+
+                # Get model and rank info
+                model = self.model_runner.model
+                tp_group = get_tp_group()
+                tp_rank = tp_group.rank_in_group if tp_group else 0
+                tp_size = server_args.tp_size if server_args else 1
+                pp_rank = self.pp_rank
+                pp_size = getattr(server_args, "pp_size", 1)
+                ep_size = getattr(server_args, "ep_size", 1)
+                dp_size = getattr(server_args, "dp_size", 1)
+
+                # Use the correct EP rank from TpModelWorker constructor
+                # self.moe_ep_rank is set from the constructor parameter (line 223)
+                ep_rank = self.moe_ep_rank if self.moe_ep_rank is not None else 0
+
+                # Calculate EP-related TP sizes
+                if ep_size > 1:
+                    ep_tp_size = tp_size // ep_size
+                    ep_tp_rank = tp_rank % ep_tp_size
+                else:
+                    ep_tp_size = 1
+                    ep_tp_rank = 0
+
+                # Create RankInfo object directly (avoid needing scheduler)
+                # engine_rank is available from server_args (set per Ray Actor engine)
+                engine_rank = getattr(server_args, "engine_rank", 0)
+                rank_info = RankInfo(
+                    tp_rank=tp_rank,
+                    tp_size=tp_size,
+                    pp_rank=pp_rank,
+                    pp_size=pp_size,
+                    dp_size=dp_size,
+                    dp_rank=0,
+                    ep_rank=ep_rank,
+                    ep_size=ep_size,
+                    ep_tp_rank=ep_tp_rank,
+                    ep_tp_size=ep_tp_size,
+                    attn_tp_rank=tp_rank,  # Same as tp_rank if no dp_attention
+                    attn_tp_size=tp_size,
+                    attn_dp_rank=0,
+                    world_size=tp_size * pp_size,
+                    global_rank=rank,
+                    engine_rank=engine_rank,
+                    local_rank=self.model_runner.gpu_id,
+                    is_infer=True,
+                )
+
+                logger.info(
+                    f"[AWEX_PRE_COLLECT] rank={rank} created RankInfo: "
+                    f"tp_rank={rank_info.tp_rank}, ep_rank={rank_info.ep_rank}, "
+                    f"engine_rank={rank_info.engine_rank}, global_rank={rank_info.global_rank}"
+                )
+
+                # Build infer_engine_config dict for converter
+                infer_engine_config = {
+                    "tp_size": tp_size,
+                    "pp_size": pp_size,
+                    "ep_size": ep_size,
+                    "dp_size": dp_size,
+                    "enable_dp_attention": getattr(server_args, "enable_dp_attention", False),
+                    "enable_dp_lm_head": getattr(server_args, "enable_dp_lm_head", False),
+                    "moe_dense_tp_size": getattr(server_args, "moe_dense_tp_size", None),
+                }
+
+                # Get the converter for parameter name conversion
+                # Note: get_infer_weights_converter signature is:
+                #   (engine_name, model_name, hf_config, rank_info, infer_engine_config)
+                model_arch_name = type(model).__name__
+                sglang_to_hf_converter = get_infer_weights_converter(
+                    engine_name="sglang",
+                    model_name=model_arch_name,  # model_name is the arch name like "DeepseekV3ForCausalLM"
+                    hf_config=model.config,
+                    rank_info=rank_info,
+                    infer_engine_config=infer_engine_config,
+                )
+
+                # Collect parameter metadata with conversion
+                # Note: dtype is stored as torch.dtype object (pickle-able via all_gather_object)
+                params_meta = []
+                for name, param in model.named_parameters():
+                    try:
+                        converted = sglang_to_hf_converter.convert_param(name, param)
+                        for hf_name, hf_param in converted:
+                            params_meta.append({
+                                "name": hf_name,
+                                "shape": list(hf_param.shape),
+                                "dtype": hf_param.dtype,  # torch.dtype object, not string
+                                "numel": hf_param.numel(),
+                            })
+                    except Exception as e:
+                        logger.warning(f"[AWEX_PRE_COLLECT] Failed to convert {name}: {e}")
+                        # Fall back to original name
+                        params_meta.append({
+                            "name": name,
+                            "shape": list(param.shape),
+                            "dtype": param.dtype,  # torch.dtype object, not string
+                            "numel": param.numel(),
+                        })
+
+                local_meta = {
+                    "rank_info": rank_info,
+                    "params_meta": params_meta,
+                    "model_arch_name": model_arch_name,
+                }
+                logger.info(
+                    f"[AWEX_PRE_COLLECT] rank={rank} collected {len(params_meta)} parameters"
+                )
+
+            except ImportError as e:
+                logger.warning(
+                    f"[AWEX_PRE_COLLECT] rank={rank} AWEX not available, "
+                    f"falling back to basic metadata collection: {e}"
+                )
+                # Fall back to basic metadata collection
+                local_meta = self._collect_local_param_meta_basic(server_args)
+
+            logger.info(
+                f"[AWEX_PRE_COLLECT] rank={rank} starting all_gather_object (world_size={world_size})..."
+            )
+
+            # All 64 workers do all_gather together
+            # This is safe because all workers are synchronized at this point
+            if dist.is_initialized() and world_size > 1:
+                all_results = [None] * world_size
+                dist.all_gather_object(all_results, local_meta, group=self.world_group.cpu_group)
+                self._awex_global_params_meta = all_results
+                logger.info(
+                    f"[AWEX_PRE_COLLECT] rank={rank} all_gather completed, "
+                    f"got metadata from {len(all_results)} workers"
+                )
+            else:
+                self._awex_global_params_meta = [local_meta]
+                logger.info(f"[AWEX_PRE_COLLECT] rank={rank} single worker, using local metadata only")
+
+        except Exception as e:
+            logger.error(f"[AWEX_PRE_COLLECT] failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Don't fail initialization, just set to None
+            self._awex_global_params_meta = None
+
+    def _collect_local_param_meta_basic(self, server_args):
+        """
+        Basic metadata collection fallback when AWEX is not available.
+
+        This collects minimal parameter information without AWEX's converter.
+        """
+        import torch.distributed as dist
+        from sglang.srt.distributed import get_tp_group
+
+        model = self.model_runner.model
+        tp_group = get_tp_group()
+        tp_rank = tp_group.rank_in_group if tp_group else 0
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        # Create a simple rank_info dict (not RankInfo object)
+        rank_info = {
+            "tp_rank": tp_rank,
+            "tp_size": server_args.tp_size,
+            "pp_rank": self.pp_rank,
+            "pp_size": getattr(server_args, "pp_size", 1),
+            "ep_rank": self.moe_ep_rank,
+            "ep_size": getattr(server_args, "ep_size", 1),
+            "dp_rank": 0,
+            "dp_size": getattr(server_args, "dp_size", 1),
+            "global_rank": rank,
+            "world_size": server_args.tp_size * getattr(server_args, "pp_size", 1),
+        }
+
+        # Collect basic parameter metadata
+        params_meta = []
+        for name, param in model.named_parameters():
+            params_meta.append({
+                "name": name,
+                "shape": list(param.shape),
+                "dtype": str(param.dtype),
+                "numel": param.numel(),
+            })
+
+        return {
+            "rank_info": rank_info,
+            "params_meta": params_meta,
+            "model_arch_name": type(model).__name__,
+            "_is_basic_meta": True,  # Mark this as basic metadata
+        }
+
+    def get_awex_global_params_meta(self):
+        """Return pre-collected AWEX global params metadata."""
+        return self._awex_global_params_meta
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter

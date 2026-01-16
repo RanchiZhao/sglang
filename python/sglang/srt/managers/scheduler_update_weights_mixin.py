@@ -262,7 +262,16 @@ class SchedulerUpdateWeightsMixin:
                 self.tp_worker.model_runner.model
             )
             _log_gpu_memory("release_memory_occupation AFTER export_static_state")
+            logger.info(
+                f"[PROFILE] release_memory_occupation BEFORE barrier | "
+                f"tp_rank={getattr(self, 'tp_rank', 'unknown')} tp_size={getattr(self, 'tp_size', 'unknown')} "
+                f"tp_cpu_group={self.tp_cpu_group}"
+            )
             torch.distributed.barrier(self.tp_cpu_group)
+            logger.info(
+                f"[PROFILE] release_memory_occupation AFTER barrier | "
+                f"tp_rank={getattr(self, 'tp_rank', 'unknown')}"
+            )
             _log_gpu_memory("release_memory_occupation BEFORE pause(weights)")
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
             _log_gpu_memory("release_memory_occupation AFTER pause(weights)")
