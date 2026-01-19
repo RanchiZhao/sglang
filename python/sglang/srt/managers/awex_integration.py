@@ -120,6 +120,7 @@ class SGLangSchedulerAdapter:
         1. If pre-collected global metadata exists (from TpModelWorker initialization):
            - Return the pre-collected metadata directly
            - This avoids the all_gather deadlock issue
+           - ONLY applies to metadata collection functions (_get_model_param_info)
 
         2. Otherwise, fall back to previous behavior:
            - awex_per_node_mode=True: return local metadata only
@@ -132,13 +133,18 @@ class SGLangSchedulerAdapter:
             rank = dist.get_rank() if dist.is_initialized() else 0
             world_size = dist.get_world_size() if dist.is_initialized() else 1
 
+            # Only use pre-collected metadata for metadata collection functions
+            # Other functions (like _update_parameters_in_tp_worker, _init_in_tp_worker) must be executed
+            fn_name = getattr(fn, '__name__', str(fn))
+            is_metadata_collection = '_get_model_param_info' in fn_name
+
             # Check if we have pre-collected global metadata
             # This is collected during TpModelWorker initialization when all workers are synchronized
             pre_collected_meta = self._scheduler.tp_worker.get_awex_global_params_meta()
 
             enable_colocate = getattr(self._server_args, "enable_colocate_mode", False)
 
-            if pre_collected_meta is not None and len(pre_collected_meta) > 0:
+            if is_metadata_collection and pre_collected_meta is not None and len(pre_collected_meta) > 0:
                 # Check if the pre-collected metadata is valid (not basic fallback)
                 first_meta = pre_collected_meta[0] if pre_collected_meta else None
                 is_valid = (

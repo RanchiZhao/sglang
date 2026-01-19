@@ -123,7 +123,9 @@ class SchedulerUpdateWeightsMixin:
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        torch.distributed.barrier(group=self.tp_cpu_group)
+        # Use cpu_group for DP attention compatibility (prevents deadlock in colocate mode)
+        barrier_group = getattr(self, 'cpu_group', self.tp_cpu_group)
+        torch.distributed.barrier(group=barrier_group)
         return UpdateWeightsFromTensorReqOutput(success, message)
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
@@ -135,7 +137,9 @@ class SchedulerUpdateWeightsMixin:
                 assert flush_cache_success, "Cache flush failed after updating weights"
         else:
             logger.error(message)
-        torch.distributed.barrier(group=self.tp_cpu_group)
+        # Use cpu_group for DP attention compatibility (prevents deadlock in colocate mode)
+        barrier_group = getattr(self, 'cpu_group', self.tp_cpu_group)
+        torch.distributed.barrier(group=barrier_group)
         return UpdateWeightsFromIPCReqOutput(success, message)
 
     def update_weights_from_awex(self: Scheduler, recv_req: UpdateWeightsFromAwexReqInput):
@@ -262,12 +266,18 @@ class SchedulerUpdateWeightsMixin:
                 self.tp_worker.model_runner.model
             )
             _log_gpu_memory("release_memory_occupation AFTER export_static_state")
+            # Use self.cpu_group instead of self.tp_cpu_group:
+            # - With DP attention: cpu_group = attn_tp_cpu_group (8 workers per DP group)
+            # - Without DP attention: cpu_group = tp_cpu_group (all workers)
+            # This prevents deadlock in colocate mode where only one Scheduler executes
+            # but tp_cpu_group includes workers from all 8 Ray Actors (64 workers).
+            barrier_group = getattr(self, 'cpu_group', self.tp_cpu_group)
             logger.info(
                 f"[PROFILE] release_memory_occupation BEFORE barrier | "
                 f"tp_rank={getattr(self, 'tp_rank', 'unknown')} tp_size={getattr(self, 'tp_size', 'unknown')} "
-                f"tp_cpu_group={self.tp_cpu_group}"
+                f"barrier_group={barrier_group} (cpu_group)"
             )
-            torch.distributed.barrier(self.tp_cpu_group)
+            torch.distributed.barrier(barrier_group)
             logger.info(
                 f"[PROFILE] release_memory_occupation AFTER barrier | "
                 f"tp_rank={getattr(self, 'tp_rank', 'unknown')}"
@@ -311,7 +321,9 @@ class SchedulerUpdateWeightsMixin:
             _log_gpu_memory("resume_memory_occupation BEFORE resume(weights)")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             _log_gpu_memory("resume_memory_occupation AFTER resume(weights)")
-            torch.distributed.barrier(self.tp_cpu_group)
+            # Use self.cpu_group instead of self.tp_cpu_group (same reason as release_memory_occupation)
+            barrier_group = getattr(self, 'cpu_group', self.tp_cpu_group)
+            torch.distributed.barrier(barrier_group)
             _log_gpu_memory("resume_memory_occupation BEFORE import_static_state")
             _import_static_state(
                 self.tp_worker.model_runner.model,

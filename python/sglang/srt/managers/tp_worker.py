@@ -322,8 +322,12 @@ class TpModelWorker(BaseTpWorker):
         # This must happen when ALL workers are synchronized (right after broadcast_pyobj)
         # All 64 workers participate in all_gather, avoiding the deadlock issue
         self._awex_global_params_meta = None
+        self._awex_colocate_init_state = None  # Pre-initialized colocate state
         if getattr(server_args, "enable_colocate_mode", False):
             self._pre_collect_awex_metadata(server_args)
+            # Pre-initialize colocate mode registration with MetaServer
+            # This ensures ALL workers register with MetaServer while synchronized
+            self._pre_init_awex_colocate(server_args)
 
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
@@ -552,6 +556,204 @@ class TpModelWorker(BaseTpWorker):
     def get_awex_global_params_meta(self):
         """Return pre-collected AWEX global params metadata."""
         return self._awex_global_params_meta
+
+    def _pre_init_awex_colocate(self, server_args):
+        """
+        Pre-initialize AWEX colocate mode registration with MetaServer.
+
+        This method is called when ALL workers are synchronized during TpModelWorker init.
+        It performs the critical MetaServer registration that NCCLWeightsReader needs:
+        1. Cleanup stale keys (only rank 0)
+        2. Register this worker's device info with MetaServer
+        3. Wait for all workers to register (barrier)
+        4. Store device mappings for later use
+
+        This solves the issue where execute_task_in_model_worker only runs on ~2 workers
+        instead of all 128, causing MetaServer wait_set_until_size to timeout.
+
+        Args:
+            server_args: Server arguments containing configuration
+        """
+        import torch.distributed as dist
+        import os
+        import time
+
+        try:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+
+            # Get MetaServer address
+            meta_server_addr = getattr(server_args, "meta_server_addr", None)
+            if meta_server_addr is None:
+                meta_server_addr = os.environ.get("AWEX_META_SERVER_ADDR")
+
+            if not meta_server_addr:
+                logger.warning(
+                    f"[AWEX_PRE_INIT_COLOCATE] rank={rank} No MetaServer address, skipping pre-init"
+                )
+                return
+
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] rank={rank} world_size={world_size} "
+                f"Starting AWEX colocate mode pre-initialization with MetaServer {meta_server_addr}..."
+            )
+
+            from awex.meta.meta_server import MetaServerClient
+            from awex.util.common import get_ip_address
+            import torch
+
+            host, port = meta_server_addr.split(":")
+            meta_client = MetaServerClient(host, port)
+
+            ip_address = get_ip_address()
+            device_id = torch.cuda.current_device()
+            engine_rank = getattr(server_args, "engine_rank", 0)
+
+            # Calculate transfer_rank and infer_world_size
+            # For colocate multi-engine mode, transfer_rank is the TRUE global rank (0 to total_workers-1)
+            tp_size = getattr(server_args, "tp_size", 1)
+            pp_size = getattr(server_args, "pp_size", 1)
+            num_engines = getattr(server_args, "num_engines", 1)
+
+            # Total expected workers from inference side = num_engines * workers_per_engine
+            # For 2 engines with 64 workers each: 2 * 64 = 128
+            workers_per_engine = tp_size * pp_size
+            infer_world_size = num_engines * workers_per_engine
+
+            # CRITICAL FIX: In multi-engine mode, dist.get_rank() returns the rank WITHIN each engine (0-63),
+            # not the true global rank (0-127). We must calculate the true global rank ourselves.
+            # Engine 0: workers 0-63, Engine 1: workers 64-127
+            # So: true_global_rank = engine_rank * workers_per_engine + local_rank
+            transfer_rank = engine_rank * workers_per_engine + rank
+
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] local_rank={rank} ip={ip_address} device={device_id} "
+                f"transfer_rank={transfer_rank} (= {engine_rank} * {workers_per_engine} + {rank}) "
+                f"engine_rank={engine_rank} num_engines={num_engines} infer_world_size={infer_world_size}"
+            )
+
+            # CRITICAL: Cannot use torch.distributed.barrier() for cross-engine synchronization!
+            # Each engine has its own process group (64 workers each), barrier only works within one group.
+            # Use MetaServer-based synchronization instead for 128-worker global sync.
+            is_global_rank_zero = (engine_rank == 0 and rank == 0)
+
+            # Use epoch-based synchronization to avoid stale data from previous runs.
+            # Each run gets a unique epoch, preventing workers from seeing old cleanup_done signals.
+            import time
+            epoch_key = "inference_pre_init_epoch"
+
+            # Step 1: Rank 0 does cleanup FIRST and sets a new epoch
+            if is_global_rank_zero:
+                logger.info(
+                    f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} is TRUE global rank 0, doing cleanup..."
+                )
+                # Generate new epoch for this run
+                new_epoch = int(time.time() * 1000)  # millisecond timestamp
+
+                # Clean up ALL stale data first (including epoch key!)
+                meta_client.delete_if_exists("inference_device_rank_entries")
+                meta_client.delete_if_exists("training_device_rank_entries")
+                meta_client.delete_if_exists("all_training_offloaded_weights")
+                meta_client.delete_if_exists("inference_cleanup_barrier")
+                meta_client.delete_if_exists("inference_cleanup_starting")
+                meta_client.delete_if_exists("inference_cleanup_done")
+                meta_client.delete_if_exists("inference_cleanup_current_epoch")
+                meta_client.delete_if_exists("inference_pre_init_arrived")
+                meta_client.delete_if_exists(epoch_key)  # CRITICAL: delete old epoch to prevent race!
+
+                # Cleanup stale IPC keys for step 1
+                for step_id in [1]:
+                    key_suffix = f"_{ip_address}_{device_id}_{step_id}"
+                    meta_client.delete_if_exists(f"training_serialized_weights{key_suffix}")
+                    meta_client.delete_if_exists(f"weights_update_finished{key_suffix}")
+
+                # Set the new epoch - this tells other workers which epoch to use
+                meta_client.put_object(epoch_key, new_epoch)
+                # Also set inference_cleanup_done for training side to detect
+                # (training side waits for this key before registering)
+                meta_client.put_object("inference_cleanup_done", True)
+                logger.info(
+                    f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} cleanup completed, epoch={new_epoch}"
+                )
+
+            # Step 2: All workers get the current epoch (blocks until rank 0 sets it)
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} waiting for epoch..."
+            )
+            current_epoch = meta_client.get_object(epoch_key, timeout=180)
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} got epoch={current_epoch}"
+            )
+
+            # Step 3: All workers signal arrival using epoch-specific key
+            arrival_key = f"inference_pre_init_arrived_{current_epoch}"
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} signaling arrival to {arrival_key}..."
+            )
+            meta_client.add_object_to_set(arrival_key, transfer_rank)
+
+            # Step 4: Wait for all 128 workers to arrive
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} waiting for {infer_world_size} workers..."
+            )
+            meta_client.wait_set_until_size(arrival_key, infer_world_size, timeout=180)
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} all workers arrived, registering..."
+            )
+
+            # Step 5: Register this worker with MetaServer
+            meta_client.add_object_to_set(
+                "inference_device_rank_entries",
+                (ip_address, device_id, transfer_rank),
+            )
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} registered with MetaServer: "
+                f"ip={ip_address} device={device_id}"
+            )
+
+            # Wait for all inference workers to register
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} waiting for {infer_world_size} inference workers..."
+            )
+            meta_client.wait_set_until_size(
+                "inference_device_rank_entries", infer_world_size, timeout=180
+            )
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} all {infer_world_size} inference workers registered"
+            )
+
+            # Get device mappings
+            inference_device_entries = meta_client.get_set("inference_device_rank_entries")
+            inference_device_mapping = {
+                (ip, dev): tr for ip, dev, tr in inference_device_entries
+            }
+
+            # Store the initialization state for NCCLWeightsReader to use later
+            self._awex_colocate_init_state = {
+                "ip_address": ip_address,
+                "device_id": device_id,
+                "transfer_rank": transfer_rank,
+                "engine_rank": engine_rank,
+                "infer_world_size": infer_world_size,
+                "inference_device_mapping": inference_device_mapping,
+                "meta_server_addr": meta_server_addr,
+                "initialized": True,
+            }
+
+            logger.info(
+                f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank} pre-initialization completed successfully"
+            )
+
+        except Exception as e:
+            logger.error(f"[AWEX_PRE_INIT_COLOCATE] rank={transfer_rank if 'transfer_rank' in dir() else rank} failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Don't fail initialization, just set to None
+            self._awex_colocate_init_state = None
+
+    def get_awex_colocate_init_state(self):
+        """Return pre-initialized AWEX colocate state."""
+        return self._awex_colocate_init_state
 
     def register_hicache_layer_transfer_counter(self, counter: LayerDoneCounter):
         self.hicache_layer_transfer_counter = counter
